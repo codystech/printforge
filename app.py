@@ -138,14 +138,21 @@ def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None
     return f.read_text()
 
 
+LAST_BACKEND = "none"  # which model produced the most recent generation (single-user app)
+
+
 async def call_llm(messages: list[dict], images: list[str] | None = None) -> str:
+    global LAST_BACKEND
     if LLM_BACKEND == "codex":
         try:
-            return await asyncio.to_thread(call_codex, messages, images)
+            result = await asyncio.to_thread(call_codex, messages, images)
+            LAST_BACKEND = "codex/gpt-5.5"
+            return result
         except Exception as e:
             if images:
                 raise HTTPException(502, f"codex backend failed and image input needs codex: {e}")
             print(f"codex backend failed ({e}); falling back to {LLM_MODEL}")
+    LAST_BACKEND = f"local/{LLM_MODEL}"
     if images:
         raise HTTPException(422, "image input needs the codex backend (LLM_BACKEND=codex)")
     async with httpx.AsyncClient(timeout=180) as client:
@@ -619,7 +626,9 @@ async def generate(req: GenerateRequest):
             "The attached images (if any) are renders of the current model and/or a "
             f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
         )
+        global LAST_BACKEND
         scad = await asyncio.to_thread(call_codex_edit, req.current_scad, instruction, images)
+        LAST_BACKEND = "codex/gpt-5.5 (edit)"
         try:
             stl = render_stl(scad, {})
         except HTTPException as e:
@@ -679,7 +688,8 @@ async def generate(req: GenerateRequest):
     except Exception:
         warnings = 0
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,
-            "qa": qa, "model_id": model_id, "print_warnings": warnings}
+            "qa": qa, "model_id": model_id, "print_warnings": warnings,
+            "backend": LAST_BACKEND}
 
 
 @app.post("/render")

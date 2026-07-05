@@ -235,6 +235,7 @@ async function generate(fresh) {
       : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
       : '';
     if (r.print_warnings) qaMsg += ` — ⚠ ${r.print_warnings} floating spot(s), refine to fix or slice with supports`;
+    if (r.backend?.startsWith('local')) qaMsg += ` — ⚠ made by the local fallback model (codex rate-limited): expect crude results until the pool resets`;
     $('prompt').value = '';
     clearImage();
     clearMesh();
