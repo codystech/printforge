@@ -135,7 +135,7 @@ async function showStl(id, fit) {
 
 // --- app state ---
 const $ = id => document.getElementById(id);
-let scad = null, stlId = null, refImage = null, meshId = null;
+let scad = null, stlId = null, refImage = null, meshId = null, currentModelId = null;
 
 let tick = null;
 function setStatus(msg, cls = '') {
@@ -210,6 +210,7 @@ async function api(path, body, method = 'POST') {
 
 function showModel(r, statusMsg, cls = 'good') {
   scad = r.scad; stlId = r.stl_id;
+  currentModelId = r.model_id ?? r.meta?.id ?? currentModelId;
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
@@ -224,7 +225,7 @@ async function generate(fresh) {
   $('go').disabled = $('new').disabled = true;
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
-    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId });
+    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId, parent_id: fresh ? null : currentModelId });
     let qaMsg = r.qa === 'passed' ? 'vision check: passed'
       : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
       : '';

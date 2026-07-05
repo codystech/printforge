@@ -54,6 +54,7 @@ class GenerateRequest(BaseModel):
     current_scad: str | None = None
     image: str | None = None  # data URL (photo/sketch reference)
     mesh_id: str | None = None  # uploaded base mesh to remix
+    parent_id: str | None = None  # library model this refine builds on (intent lineage)
 
 
 class RenderRequest(BaseModel):
@@ -125,7 +126,7 @@ def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None
     for img in images or []:
         cmd += ["-i", img]
     cmd.append("-")
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=420)
+    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
         raise RuntimeError(f"codex edit failed: {proc.stderr[-500:]}")
     return f.read_text()
@@ -227,12 +228,15 @@ def mesh_changes(base_stl: Path, new_stl: Path):
 
 
 async def vision_qa(prompt: str, scad: str, stl: Path,
-                    base_stl: Path | None = None) -> tuple[str, Path, str]:
+                    base_stl: Path | None = None,
+                    intent: list[str] | None = None) -> tuple[str, Path, str]:
     """One round of render-and-review; returns (scad, stl, qa_status)."""
     # oblique perspective views: straight-on orthographic hides low relief entirely
     scad_path = WORK_DIR / f"{stl.stem}.scad"
     views = []
     qa_notes = []
+    if intent:
+        qa_notes.append(intent_block(intent))
     # per-cluster close-ups of geometry that differs from the base mesh — whole-model
     # renders make a 10mm addition a smudge the reviewer cannot judge
     if base_stl and base_stl.exists():
@@ -241,7 +245,7 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
         except Exception:
             regions, removed = [], None
         region_descs = []
-        for i, (mn, mx) in enumerate(regions):
+        for i, (mn, mx) in enumerate(regions[:2]):
             c = [(a + b) / 2 for a, b in zip(mn, mx)]
             dist = max(8.0, 2.2 * max(b - a for a, b in zip(mn, mx)))
             region_descs.append(
@@ -284,11 +288,12 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
             "ignore those."
         )
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png"))
-    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340"))
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
                             camera="0,0,0,70,0,25,340", ortho=False, imgsize="1000,750"))
-    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob2.png",
-                            camera="0,0,0,70,0,205,340", ortho=False, imgsize="1000,750"))
+    if not any(views[:-2]):  # no closeups: add the wider set back
+        views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340"))
+        views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob2.png",
+                                camera="0,0,0,70,0,205,340", ortho=False, imgsize="1000,750"))
     images = [str(p) for p in views if p]
     if not images:
         return scad, stl, "skipped"
@@ -305,7 +310,18 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     return edited, fixed_stl, "fixed"
 
 
-def save_to_library(prompt: str, scad: str, stl: Path) -> str:
+def load_intent(parent_id: str | None) -> list[str]:
+    """Accepted design decisions inherited from the parent model's lineage."""
+    if not parent_id or not re.fullmatch(r"[0-9a-f]{12}", parent_id):
+        return []
+    meta_file = LIB_DIR / parent_id / "meta.json"
+    if not meta_file.exists():
+        return []
+    meta = json.loads(meta_file.read_text())
+    return meta.get("intent", [])
+
+
+def save_to_library(prompt: str, scad: str, stl: Path, intent: list[str]) -> str:
     model_id = uuid.uuid4().hex[:12]
     mdir = LIB_DIR / model_id
     mdir.mkdir()
@@ -314,10 +330,22 @@ def save_to_library(prompt: str, scad: str, stl: Path) -> str:
         "id": model_id,
         "name": prompt.strip()[:60],
         "prompt": prompt,
+        "intent": intent[-12:],
         "created": time.time(),
     }))
     render_png(WORK_DIR / f"{stl.stem}.scad", mdir / "thumb.png", imgsize="400,300")
     return model_id
+
+
+def intent_block(intent: list[str]) -> str:
+    if not intent:
+        return ""
+    lines = "\n- ".join(intent)
+    return (
+        "\nDESIGN HISTORY — changes the user already made and accepted. Every one of "
+        "them MUST still hold after your edit unless the new request explicitly undoes "
+        f"it. Never revert these to satisfy another goal:\n- {lines}\n"
+    )
 
 
 def _register_mesh(raw: bytes, filename: str) -> dict:
@@ -481,9 +509,25 @@ async def generate(req: GenerateRequest):
     if req.current_scad and LLM_BACKEND == "codex":
         # refines edit the existing file in place — reprinting long files wholesale
         # reliably drops unrelated features
+        float_note = ""
+        try:
+            prev_stl = render_stl(req.current_scad, {})
+            floats = await asyncio.to_thread(floating_starts, prev_stl)
+            if floats:
+                desc = "; ".join(f"z={f['z']} at ({f['x']},{f['y']})" for f in floats[:10])
+                float_note = (
+                    f"\nKnown printability problems in the CURRENT model — features that "
+                    f"begin in mid-air when sliced bottom-up: {desc}. While applying the "
+                    "request, also seat these (embed 2-3mm downward into whatever is below, "
+                    "or give a >=45-degree self-supporting underside). Ball-on-post tips "
+                    "are fine."
+                )
+        except Exception:
+            pass
         instruction = SYSTEM_PROMPT + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+            intent_block(load_intent(req.parent_id)) +
             "The attached images (if any) are renders of the current model and/or a "
-            f"user-provided reference photo.\nModification request: {req.prompt}"
+            f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
         )
         scad = await asyncio.to_thread(call_codex_edit, req.current_scad, instruction, images)
         try:
@@ -523,7 +567,8 @@ async def generate(req: GenerateRequest):
         fixes = 0
         for _ in range(QA_ROUNDS):
             try:
-                scad, stl, status = await vision_qa(req.prompt, scad, stl, base_stl)
+                scad, stl, status = await vision_qa(req.prompt, scad, stl, base_stl,
+                                                    load_intent(req.parent_id))
             except Exception as e:
                 print(f"vision QA failed: {e}")
                 qa = f"fixed x{fixes}" if fixes else "skipped"
@@ -535,7 +580,8 @@ async def generate(req: GenerateRequest):
         else:
             qa = f"fixed x{fixes}"
 
-    model_id = save_to_library(req.prompt, scad, stl)
+    model_id = save_to_library(req.prompt, scad, stl,
+                               load_intent(req.parent_id) + [req.prompt])
     try:
         warnings = len(await asyncio.to_thread(floating_starts, stl))
     except Exception:
