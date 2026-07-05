@@ -11,7 +11,8 @@ import uuid
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+import trimesh
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,6 +35,8 @@ WORK_DIR = Path(tempfile.gettempdir()) / "printforge"
 WORK_DIR.mkdir(exist_ok=True)
 LIB_DIR = Path(__file__).parent / "library"
 LIB_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR = Path(__file__).parent / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="PrintForge")
 
@@ -49,6 +52,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     current_scad: str | None = None
     image: str | None = None  # data URL (photo/sketch reference)
+    mesh_id: str | None = None  # uploaded base mesh to remix
 
 
 class RenderRequest(BaseModel):
@@ -95,7 +99,7 @@ def call_codex(messages: list[dict], images: list[str] | None = None) -> str:
     for img in images or []:
         cmd += ["-i", img]
     cmd.append("-")
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300)
+    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=420)
     if proc.returncode != 0 or not out.exists():
         raise RuntimeError(f"codex exec failed: {proc.stderr[-500:]}")
     return strip_fences(out.read_text())
@@ -193,6 +197,47 @@ def save_to_library(prompt: str, scad: str, stl: Path) -> str:
     return model_id
 
 
+@app.post("/upload-mesh")
+async def upload_mesh(file: UploadFile = File(...)):
+    ext = Path(file.filename or "m.stl").suffix.lower()
+    if ext not in {".stl", ".3mf", ".obj"}:
+        raise HTTPException(415, "upload .stl, .3mf or .obj")
+    raw = await file.read()
+    if len(raw) > 100_000_000:
+        raise HTTPException(413, "mesh too large")
+    mesh_id = uuid.uuid4().hex[:12]
+    tmp = UPLOADS_DIR / f"{mesh_id}{ext}"
+    tmp.write_bytes(raw)
+    try:
+        m = trimesh.load(tmp, force="mesh")
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(422, f"could not read mesh: {e}")
+    stl_path = UPLOADS_DIR / f"{mesh_id}.stl"
+    m.export(stl_path)
+    if tmp != stl_path:
+        tmp.unlink()
+    meta = {"id": mesh_id, "name": file.filename,
+            "bounds_min": [round(v, 1) for v in m.bounds[0]],
+            "bounds_max": [round(v, 1) for v in m.bounds[1]]}
+    (UPLOADS_DIR / f"{mesh_id}.json").write_text(json.dumps(meta))
+    return meta
+
+
+def _mesh_note(mesh_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{12}", mesh_id):
+        raise HTTPException(400, "bad mesh id")
+    meta_file = UPLOADS_DIR / f"{mesh_id}.json"
+    if not meta_file.exists():
+        raise HTTPException(404, "mesh not found")
+    meta = json.loads(meta_file.read_text())
+    path = (UPLOADS_DIR / f"{mesh_id}.stl").resolve()
+    return (
+        f'BASE MESH provided ("{meta["name"]}"): import("{path}");\n'
+        f"Its bounding box is min {meta['bounds_min']} to max {meta['bounds_max']} mm (x,y,z)."
+    )
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
     images = []
@@ -204,9 +249,18 @@ async def generate(req: GenerateRequest):
             images = [str(img_path)]
         except Exception:
             raise HTTPException(400, "bad image data URL")
+    # refinements get renders of the current model so the LLM isn't editing blind
+    if req.current_scad and LLM_BACKEND == "codex":
+        cur = WORK_DIR / f"cur-{uuid.uuid4().hex}.scad"
+        cur.write_text(req.current_scad)
+        for cam, tag in ((None, "iso"), ("0,0,0,0,0,0,340", "top")):
+            p = render_png(cur, cur.with_name(f"{cur.stem}_{tag}.png"), camera=cam)
+            if p:
+                images.append(str(p))
+    mesh_note = _mesh_note(req.mesh_id) if req.mesh_id else None
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt(req.prompt, req.current_scad)},
+        {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
     ]
     scad = await call_llm(messages, images)
     # validate by rendering; on failure, one automatic retry with the error fed back

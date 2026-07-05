@@ -28,6 +28,12 @@ Rules — follow ALL of them:
     printed in the assembled position, no support-needing overhangs inside the joint.
 12. A reference image may be attached: reproduce the pictured object's shape and
     proportions as printable geometry, inferring reasonable millimeter dimensions.
+13. When a BASE MESH file is provided, build on it with import("<given path>") — never
+    re-model the base shape from primitives. The prompt states its exact bounding box;
+    position added features using those coordinates. Raised text/logos: union a
+    linear_extrude that intersects the surface by ~0.6mm. Engraved: difference. Keep
+    customizer variables for what you add (text, size, depth, position offsets).
+    Rotate/translate the import only if the user asks.
 
 Example 1 — "a wall bracket with two screw holes":
 width = 60; // [20:150]
@@ -88,11 +94,17 @@ def qa_prompt(request: str, scad: str) -> str:
     )
 
 
-def user_prompt(request: str, current_scad: str | None) -> str:
+def user_prompt(request: str, current_scad: str | None, mesh_note: str | None = None) -> str:
+    parts = []
+    if mesh_note:
+        parts.append(mesh_note)
     if current_scad:
-        return (
+        parts.append(
             f"Current OpenSCAD file:\n{current_scad}\n\n"
+            "The attached images (if any) are renders of this current model.\n"
             f"Modification request: {request}\n"
-            "Return the complete updated file."
+            "Apply the change decisively and return the complete updated file."
         )
-    return f"Create a 3D-printable model: {request}"
+    else:
+        parts.append(f"Create a 3D-printable model: {request}")
+    return "\n\n".join(parts)

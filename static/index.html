@@ -54,9 +54,12 @@
   </div>
   <textarea id="prompt" placeholder="Describe a model… once one exists, typing here refines it. Attach a photo/sketch below for reference."></textarea>
   <div id="imgrow">
-    <button id="imgbtn" class="secondary" type="button">📷 attach image</button>
+    <button id="imgbtn" class="secondary" type="button">📷 image</button>
     <input id="imgfile" type="file" accept="image/*" hidden>
     <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
+    <button id="meshbtn" class="secondary" type="button">📦 base model</button>
+    <input id="meshfile" type="file" accept=".stl,.3mf,.obj" hidden>
+    <span id="meshchip" style="display:none;align-items:center;gap:6px;font-size:12px;color:#aab"><span id="meshname"></span><b id="meshclear" style="cursor:pointer;color:#ff7b72">✕</b></span>
   </div>
   <button id="go">Generate</button>
   <button id="new" class="secondary" hidden>New model (start fresh)</button>
@@ -130,7 +133,7 @@ async function showStl(id, fit) {
 
 // --- app state ---
 const $ = id => document.getElementById(id);
-let scad = null, stlId = null, refImage = null;
+let scad = null, stlId = null, refImage = null, meshId = null;
 
 let tick = null;
 function setStatus(msg, cls = '') {
@@ -219,10 +222,11 @@ async function generate(fresh) {
   $('go').disabled = $('new').disabled = true;
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
-    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage });
+    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId });
     const qaMsg = { passed: 'vision check: passed', fixed: 'vision check: fixed an issue', skipped: '' }[r.qa] ?? '';
     $('prompt').value = '';
     clearImage();
+    clearMesh();
     await showModel(r, qaMsg);
     loadLibrary();
   } catch (e) { setStatus(e.message, 'error'); }
@@ -252,6 +256,28 @@ $('imgfile').onchange = () => {
   rd.readAsDataURL(f);
   $('imgfile').value = '';
 };
+// --- base mesh input ---
+function clearMesh() { meshId = null; $('meshchip').style.display = 'none'; }
+$('meshclear').onclick = clearMesh;
+$('meshbtn').onclick = () => $('meshfile').click();
+$('meshfile').onchange = async () => {
+  const f = $('meshfile').files[0];
+  if (!f) return;
+  $('meshfile').value = '';
+  setBusyStatus('Uploading base model…');
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const r = await fetch('/upload-mesh', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+    const m = await r.json();
+    meshId = m.id;
+    $('meshname').textContent = `📦 ${m.name}`;
+    $('meshchip').style.display = 'inline-flex';
+    setStatus('base model attached — describe what to add or change', 'good');
+  } catch (e) { setStatus(e.message, 'error'); }
+};
+
 document.addEventListener('paste', e => {
   const item = [...(e.clipboardData?.items ?? [])].find(i => i.type.startsWith('image/'));
   if (!item) return;
