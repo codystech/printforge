@@ -1,0 +1,13 @@
+services:
+  printforge:
+    build: .
+    # host networking: LiteLLM binds 127.0.0.1 only, so share the host loopback.
+    # App listens on host port 8093 directly.
+    network_mode: host
+    environment:
+      # debian's openscad is 2021.01: no textmetrics/manifold feature flags
+      OPENSCAD_ARGS: ""
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:4000/v1}
+      LLM_MODEL: ${LLM_MODEL:-claude-brain-coder}
+      LLM_API_KEY: ${LLM_API_KEY:-dummy}
+    restart: unless-stopped

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PrintForge</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { font: 14px/1.4 system-ui, sans-serif; background: #16181d; color: #e6e6e6; display: flex; height: 100vh; }
+  #panel { width: 360px; min-width: 360px; padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; background: #1e2128; border-right: 1px solid #2c3038; }
+  #viewer { flex: 1; position: relative; }
+  #viewer canvas { display: block; }
+  h1 { font-size: 18px; } h1 span { color: #e8734a; }
+  textarea { width: 100%; height: 72px; resize: vertical; background: #14161a; color: #e6e6e6; border: 1px solid #3a3f48; border-radius: 6px; padding: 8px; font: inherit; }
+  button { padding: 9px 12px; border: 0; border-radius: 6px; background: #e8734a; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  button.secondary { background: #3a3f48; }
+  #chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  #chips button { padding: 4px 9px; font-size: 12px; font-weight: 400; background: #2a2e36; color: #aab; border: 1px solid #3a3f48; }
+  #chips button:hover { color: #e6e6e6; border-color: #e8734a; }
+  #imgrow { display: flex; gap: 8px; align-items: center; }
+  #imgrow button { padding: 5px 10px; font-size: 12px; }
+  #imgchip { display: none; align-items: center; gap: 6px; font-size: 12px; color: #aab; }
+  #imgchip img { height: 34px; border-radius: 4px; }
+  #imgchip b { cursor: pointer; color: #ff7b72; }
+  #params { display: flex; flex-direction: column; gap: 10px; }
+  .param label { display: flex; justify-content: space-between; margin-bottom: 3px; color: #aab; }
+  .param input[type=range] { width: 100%; accent-color: #e8734a; }
+  .param input[type=text] { width: 100%; background: #14161a; color: #e6e6e6; border: 1px solid #3a3f48; border-radius: 4px; padding: 5px 8px; font: inherit; }
+  #status { min-height: 20px; color: #8a93a3; white-space: pre-wrap; font-size: 12px; }
+  #status.error { color: #ff7b72; }
+  #status.good { color: #7bd88f; }
+  details { font-size: 12px; } details pre { background: #14161a; padding: 8px; border-radius: 6px; overflow-x: auto; max-height: 240px; }
+  #lib { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .libitem { background: #2a2e36; border-radius: 6px; overflow: hidden; cursor: pointer; }
+  .libitem img { width: 100%; height: 80px; object-fit: cover; display: block; background: #14161a; }
+  .libitem .row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
+  .libitem .name { flex: 1; font-size: 11px; color: #ccd; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .libitem .row button { padding: 1px 5px; font-size: 11px; font-weight: 400; background: none; color: #778; }
+  .libitem .row button:hover { color: #e6e6e6; }
+  .libitem .row button.armed { color: #ff7b72; font-weight: 700; }
+  .btnrow { display: flex; gap: 8px; } .btnrow button { flex: 1; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>Print<span>Forge</span></h1>
+  <div id="chips">
+    <button data-p="a gridfinity bin, 2x1 cells, 3 units tall, with a label lip">gridfinity bin</button>
+    <button data-p="a 12oz can holder mug with a sturdy handle and the name CODY embossed on the side">can holder + name</button>
+    <button data-p="a print-in-place hinged box, 80mm wide, with a snap latch">hinged box</button>
+    <button data-p="a wall clip for a 10mm round cable, screw mounted">cable clip</button>
+    <button data-p="a plaque with the text CODY as a separate raised color part on a rounded base plate">multi-color sign</button>
+  </div>
+  <textarea id="prompt" placeholder="Describe a model… once one exists, typing here refines it. Attach a photo/sketch below for reference."></textarea>
+  <div id="imgrow">
+    <button id="imgbtn" class="secondary" type="button">📷 attach image</button>
+    <input id="imgfile" type="file" accept="image/*" hidden>
+    <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
+  </div>
+  <button id="go">Generate</button>
+  <button id="new" class="secondary" hidden>New model (start fresh)</button>
+  <div id="status"></div>
+  <div id="params"></div>
+  <div class="btnrow">
+    <button id="download" class="secondary" hidden>STL</button>
+    <button id="download3mf" class="secondary" hidden>3MF (parts)</button>
+    <button id="send" class="secondary" hidden>→ Bambuddy</button>
+  </div>
+  <details hidden id="codebox"><summary>OpenSCAD source</summary><pre id="code"></pre></details>
+  <details id="libbox"><summary>Library</summary><div id="lib"></div></details>
+</div>
+<div id="viewer"></div>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js", "three/addons/": "./vendor/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { STLLoader } from './vendor/STLLoader.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+
+// --- viewer ---
+const viewer = document.getElementById('viewer');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x16181d);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 5000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+viewer.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.2));
+const dir = new THREE.DirectionalLight(0xffffff, 1.5);
+dir.position.set(1, 1, 2);
+scene.add(dir);
+// Bambu P1S bed: 256x256, origin at front-left corner
+const grid = new THREE.GridHelper(256, 16, 0x3a3f48, 0x24272e);
+grid.rotation.x = Math.PI / 2;
+grid.position.set(128, 128, 0);
+scene.add(grid);
+const origin = new THREE.AxesHelper(20);
+scene.add(origin);
+let mesh = null;
+
+function resize() {
+  camera.aspect = viewer.clientWidth / viewer.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(viewer.clientWidth, viewer.clientHeight);
+}
+window.addEventListener('resize', resize);
+resize();
+camera.up.set(0, 0, 1);
+camera.position.set(240, -180, 160);
+controls.target.set(128, 128, 0);
+(function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+
+const loader = new STLLoader();
+async function showStl(id, fit) {
+  const geo = loader.parse(await (await fetch(`/stl/${id}`)).arrayBuffer());
+  geo.computeVertexNormals();
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xe8734a, roughness: 0.55, metalness: 0.05 }));
+  scene.add(mesh);
+  if (fit) {
+    geo.computeBoundingSphere();
+    const { center, radius } = geo.boundingSphere;
+    controls.target.copy(center);
+    camera.position.set(center.x + radius * 1.8, center.y - radius * 1.8, center.z + radius * 1.4);
+  }
+}
+
+// --- app state ---
+const $ = id => document.getElementById(id);
+let scad = null, stlId = null, refImage = null;
+
+let tick = null;
+function setStatus(msg, cls = '') {
+  clearInterval(tick);
+  $('status').textContent = msg;
+  $('status').className = cls;
+}
+function setBusyStatus(msg) {
+  setStatus(msg);
+  const t0 = Date.now();
+  tick = setInterval(() => {
+    $('status').textContent = `${msg} ${Math.round((Date.now() - t0) / 1000)}s`;
+  }, 1000);
+}
+
+function buildParams(params) {
+  const box = $('params');
+  box.innerHTML = '';
+  for (const p of params) {
+    const div = document.createElement('div');
+    div.className = 'param';
+    const label = document.createElement('label');
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = p.name.replaceAll('_', ' ');
+    const valSpan = document.createElement('span');
+    label.append(nameSpan, valSpan);
+    const input = document.createElement('input');
+    input.dataset.name = p.name;
+    if (p.type === 'number') {
+      input.type = 'range';
+      input.min = p.min; input.max = p.max; input.step = p.step; input.value = p.value;
+      valSpan.textContent = p.value;
+      input.oninput = () => { valSpan.textContent = input.value; rerender(); };
+    } else {
+      input.type = 'text';
+      input.value = p.value;
+      input.oninput = () => rerender();
+    }
+    div.append(label, input);
+    box.appendChild(div);
+  }
+}
+
+function currentParams() {
+  const out = {};
+  for (const input of $('params').querySelectorAll('input'))
+    out[input.dataset.name] = input.type === 'range' ? parseFloat(input.value) : input.value;
+  return out;
+}
+
+let rerenderTimer = null, rendering = false, pending = false;
+function rerender() { clearTimeout(rerenderTimer); rerenderTimer = setTimeout(doRender, 400); }
+async function doRender() {
+  if (rendering) { pending = true; return; }
+  rendering = true;
+  setBusyStatus('Rendering…');
+  try {
+    const r = await api('/render', { scad, params: currentParams() });
+    stlId = r.stl_id;
+    await showStl(stlId, false);
+    setStatus('');
+  } catch (e) { setStatus(e.message, 'error'); }
+  rendering = false;
+  if (pending) { pending = false; doRender(); }
+}
+
+async function api(path, body, method = 'POST') {
+  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+  return r.json();
+}
+
+function showModel(r, statusMsg, cls = 'good') {
+  scad = r.scad; stlId = r.stl_id;
+  buildParams(r.params);
+  $('code').textContent = scad;
+  for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
+  $('send').hidden = !window.bambuddyOn;
+  $('go').textContent = 'Refine';
+  return showStl(stlId, true).then(() => setStatus(statusMsg, cls));
+}
+
+async function generate(fresh) {
+  const prompt = $('prompt').value.trim();
+  if (!prompt) return;
+  $('go').disabled = $('new').disabled = true;
+  setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
+  try {
+    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage });
+    const qaMsg = { passed: 'vision check: passed', fixed: 'vision check: fixed an issue', skipped: '' }[r.qa] ?? '';
+    $('prompt').value = '';
+    clearImage();
+    await showModel(r, qaMsg);
+    loadLibrary();
+  } catch (e) { setStatus(e.message, 'error'); }
+  $('go').disabled = $('new').disabled = false;
+}
+$('go').onclick = () => generate(!scad);
+$('new').onclick = () => generate(true);
+
+// --- preset chips ---
+for (const b of $('chips').querySelectorAll('button'))
+  b.onclick = () => { $('prompt').value = b.dataset.p; $('prompt').focus(); };
+
+// --- image input ---
+function setImage(dataUrl) {
+  refImage = dataUrl;
+  $('imgprev').src = dataUrl;
+  $('imgchip').style.display = 'inline-flex';
+}
+function clearImage() { refImage = null; $('imgchip').style.display = 'none'; }
+$('imgclear').onclick = clearImage;
+$('imgbtn').onclick = () => $('imgfile').click();
+$('imgfile').onchange = () => {
+  const f = $('imgfile').files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => setImage(rd.result);
+  rd.readAsDataURL(f);
+  $('imgfile').value = '';
+};
+document.addEventListener('paste', e => {
+  const item = [...(e.clipboardData?.items ?? [])].find(i => i.type.startsWith('image/'));
+  if (!item) return;
+  const rd = new FileReader();
+  rd.onload = () => setImage(rd.result);
+  rd.readAsDataURL(item.getAsFile());
+});
+
+// --- downloads / send ---
+$('download').onclick = () => { if (stlId) location.href = `/stl/${stlId}?download=1`; };
+$('download3mf').onclick = () => { if (stlId) location.href = `/export/${stlId}`; };
+$('send').onclick = async () => {
+  if (!stlId) return;
+  $('send').disabled = true;
+  setBusyStatus('Uploading to Bambuddy…');
+  try {
+    const name = encodeURIComponent(($('params').querySelector('input[type=text]')?.value ?? 'printforge-model'));
+    await api(`/send/${stlId}?name=${name}`, null);
+    setStatus('sent to Bambuddy ✓', 'good');
+  } catch (e) { setStatus(e.message, 'error'); }
+  $('send').disabled = false;
+};
+
+// --- library ---
+async function loadLibrary() {
+  const models = await api('/models', null, 'GET').catch(() => []);
+  const lib = $('lib');
+  lib.innerHTML = '';
+  for (const m of models) {
+    const div = document.createElement('div');
+    div.className = 'libitem';
+    const img = document.createElement('img');
+    img.src = `/models/${m.id}/thumb`;
+    img.onerror = () => img.removeAttribute('src');
+    const row = document.createElement('div');
+    row.className = 'row';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = m.name;
+    name.title = m.prompt;
+    const ren = document.createElement('button');
+    ren.textContent = '✎';
+    ren.onclick = async e => {
+      e.stopPropagation();
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.value = m.name; inp.style.cssText = 'width:100%;font-size:11px';
+      name.replaceWith(inp); inp.focus();
+      inp.onkeydown = async ev => {
+        if (ev.key === 'Enter') { await api(`/models/${m.id}`, { name: inp.value }, 'PATCH'); loadLibrary(); }
+        if (ev.key === 'Escape') loadLibrary();
+      };
+    };
+    const del = document.createElement('button');
+    del.textContent = '🗑';
+    del.onclick = async e => {
+      e.stopPropagation();
+      if (!del.classList.contains('armed')) { del.classList.add('armed'); del.textContent = 'sure?'; return; }
+      await api(`/models/${m.id}`, null, 'DELETE');
+      loadLibrary();
+    };
+    row.append(name, ren, del);
+    div.append(img, row);
+    div.onclick = async () => {
+      setBusyStatus('Loading…');
+      try { await showModel(await api(`/models/${m.id}`, null, 'GET'), ''); }
+      catch (e) { setStatus(e.message, 'error'); }
+    };
+    lib.appendChild(div);
+  }
+}
+
+// --- init ---
+$('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('go').click(); } });
+fetch('/config').then(r => r.json()).then(c => { window.bambuddyOn = c.bambuddy; }).catch(() => {});
+loadLibrary();
+</script>
+</body>
+</html>

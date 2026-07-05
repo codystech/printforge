@@ -1,0 +1,3 @@
+library/
+__pycache__/
+.env
