@@ -149,9 +149,10 @@ def render_stl(scad: str, params: dict) -> Path:
 
 
 def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
-               imgsize: str = "800,600", ortho: bool = True) -> Path | None:
-    cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(out_png), "--imgsize", imgsize,
-           "--autocenter", "--viewall"]
+               imgsize: str = "800,600", ortho: bool = True, fit: bool = True) -> Path | None:
+    cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(out_png), "--imgsize", imgsize]
+    if fit:
+        cmd += ["--autocenter", "--viewall"]
     if camera:
         cmd += ["--camera", camera, "--projection", "o" if ortho else "p"]
     cmd.append(str(scad_path))
@@ -162,17 +163,48 @@ def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
     return out_png if out_png.exists() else None
 
 
-async def vision_qa(prompt: str, scad: str, stl: Path) -> tuple[str, Path, str]:
+def added_region(base_stl: Path, new_stl: Path):
+    """Bounding box of geometry present in new_stl but not base_stl (or None)."""
+    import numpy as np
+    base = trimesh.load_mesh(base_stl)
+    new = trimesh.load_mesh(new_stl)
+    bc = set(map(tuple, np.round(base.triangles_center, 1)))
+    mask = np.array([tuple(c) not in bc for c in np.round(new.triangles_center, 1)])
+    if mask.sum() < 8:
+        return None
+    pts = new.triangles_center[mask]
+    return pts.min(axis=0), pts.max(axis=0)
+
+
+async def vision_qa(prompt: str, scad: str, stl: Path,
+                    base_stl: Path | None = None) -> tuple[str, Path, str]:
     """One round of render-and-review; returns (scad, stl, qa_status)."""
     # oblique perspective views: straight-on orthographic hides low relief entirely
     scad_path = WORK_DIR / f"{stl.stem}.scad"
-    iso = render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png")
-    top = render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340")
-    ob1 = render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
-                     camera="0,0,0,70,0,25,340", ortho=False, imgsize="1000,750")
-    ob2 = render_png(scad_path, WORK_DIR / f"{stl.stem}_ob2.png",
-                     camera="0,0,0,70,0,205,340", ortho=False, imgsize="1000,750")
-    images = [str(p) for p in (iso, top, ob1, ob2) if p]
+    views = []
+    # close-ups of whatever geometry differs from the base mesh — whole-model renders
+    # make a 10mm addition a smudge the reviewer cannot judge
+    if base_stl and base_stl.exists():
+        try:
+            region = await asyncio.to_thread(added_region, base_stl, stl)
+        except Exception:
+            region = None
+        if region:
+            mn, mx = region
+            c = [(a + b) / 2 for a, b in zip(mn, mx)]
+            dist = max(8.0, 2.2 * max(b - a for a, b in zip(mn, mx)))
+            for az, tag in ((30, "close1"), (210, "close2")):
+                views.append(render_png(
+                    scad_path, WORK_DIR / f"{stl.stem}_{tag}.png",
+                    camera=f"{c[0]:.1f},{c[1]:.1f},{c[2]:.1f},65,0,{az},{dist:.0f}",
+                    ortho=False, imgsize="1000,750", fit=False))
+    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png"))
+    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340"))
+    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
+                            camera="0,0,0,70,0,25,340", ortho=False, imgsize="1000,750"))
+    views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob2.png",
+                            camera="0,0,0,70,0,205,340", ortho=False, imgsize="1000,750"))
+    images = [str(p) for p in views if p]
     if not images:
         return scad, stl, "skipped"
     reply = await asyncio.to_thread(
@@ -379,10 +411,11 @@ async def generate(req: GenerateRequest):
 
     qa = "skipped"
     if LLM_BACKEND == "codex" and QA_CHECK:
+        base_stl = (UPLOADS_DIR / f"{req.mesh_id}.stl") if req.mesh_id else None
         fixes = 0
         for _ in range(QA_ROUNDS):
             try:
-                scad, stl, status = await vision_qa(req.prompt, scad, stl)
+                scad, stl, status = await vision_qa(req.prompt, scad, stl, base_stl)
             except Exception as e:
                 print(f"vision QA failed: {e}")
                 qa = f"fixed x{fixes}" if fixes else "skipped"

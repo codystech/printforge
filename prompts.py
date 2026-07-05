@@ -105,7 +105,9 @@ difference() {
 def qa_prompt(request: str, scad: str) -> str:
     return (
         "You are reviewing a 3D-printable OpenSCAD model. The attached images are "
-        "renders (isometric and top view) of the code below.\n\n"
+        "renders of the code below; when a base mesh was modified, the first two images "
+        "are CLOSE-UPS of the changed/added geometry — judge placement and shape from "
+        "those, and overall composition from the wider views.\n\n"
         f"Original request: {request}\n\nOpenSCAD code:\n{scad}\n\n"
         "Step 1: list every element/change the request demands. Step 2: for EACH one, "
         "verify it is present in the renders, sensibly placed, and proportioned to the "
