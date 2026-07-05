@@ -392,6 +392,22 @@ async function loadLibrary() {
     name.className = 'name';
     name.textContent = m.name;
     name.title = m.prompt;
+    const up = document.createElement('button');
+    up.textContent = '👍';
+    up.style.opacity = m.rating === 1 ? '1' : '.35';
+    up.onclick = async e => {
+      e.stopPropagation();
+      await api(`/models/${m.id}/rate`, { rating: m.rating === 1 ? 0 : 1 });
+      loadLibrary();
+    };
+    const down = document.createElement('button');
+    down.textContent = '👎';
+    down.style.opacity = m.rating === -1 ? '1' : '.35';
+    down.onclick = async e => {
+      e.stopPropagation();
+      await api(`/models/${m.id}/rate`, { rating: m.rating === -1 ? 0 : -1 });
+      loadLibrary();
+    };
     const ren = document.createElement('button');
     ren.textContent = '✎';
     ren.onclick = async e => {
@@ -412,7 +428,7 @@ async function loadLibrary() {
       await api(`/models/${m.id}`, null, 'DELETE');
       loadLibrary();
     };
-    row.append(name, ren, del);
+    row.append(name, up, down, ren, del);
     div.append(img, row);
     div.onclick = async () => {
       setBusyStatus('Loading…');

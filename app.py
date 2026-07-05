@@ -133,7 +133,8 @@ def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None
     cmd.append("-")
     proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
-        raise RuntimeError(f"codex edit failed: {proc.stderr[-500:]}")
+        print(f"codex edit stderr:\n{proc.stderr[-4000:]}")  # full-ish tail to server log
+        raise RuntimeError(f"codex edit failed (rc {proc.returncode}): {proc.stderr[-1500:]}")
     return f.read_text()
 
 
@@ -628,7 +629,8 @@ async def generate(req: GenerateRequest):
             stl = render_stl(scad, {})  # second failure propagates to the UI
     else:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)},
+            {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)
+                                          + _taste_example(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
         scad = await call_llm(messages, images)
@@ -821,6 +823,45 @@ async def model_thumb(model_id: str):
     if not thumb.exists():
         raise HTTPException(404, "no thumbnail")
     return FileResponse(thumb, media_type="image/png")
+
+
+class RateRequest(BaseModel):
+    rating: int  # 1 thumbs-up, -1 thumbs-down, 0 clear
+
+
+@app.post("/models/{model_id}/rate")
+async def rate_model(model_id: str, req: RateRequest):
+    mdir = _model_dir(model_id)
+    meta = json.loads((mdir / "meta.json").read_text())
+    meta["rating"] = max(-1, min(1, req.rating))
+    (mdir / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
+def _taste_example(prompt: str) -> str:
+    """SCAD of the best-matching thumbs-up model — the user's own taste as a few-shot."""
+    words = set(re.findall(r"[a-z]{3,}", prompt.lower()))
+    best, best_score = None, 1  # require >=2 overlapping words
+    for mdir in LIB_DIR.iterdir():
+        mf = mdir / "meta.json"
+        if not mf.exists():
+            continue
+        meta = json.loads(mf.read_text())
+        if meta.get("rating", 0) <= 0:
+            continue
+        mwords = set(re.findall(r"[a-z]{3,}",
+                                f"{meta.get('prompt', '')} {meta.get('name', '')}".lower()))
+        score = len(words & mwords)
+        if score > best_score:
+            best, best_score = mdir, score
+    if not best:
+        return ""
+    scad = (best / "model.scad").read_text()
+    if len(scad) > 8000:
+        return ""
+    return ("\n\nUSER-APPROVED EXAMPLE — the user rated this result highly for a similar "
+            "request; match its conventions, printability choices and quality bar:\n"
+            + scad)
 
 
 @app.patch("/models/{model_id}")
