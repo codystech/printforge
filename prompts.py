@@ -39,9 +39,11 @@ Rules — follow ALL of them:
        to the desired raise. Never place a feature at bbox max-Z assuming a surface is
        there.
     b. Everything you add must sit fully INSIDE the base's outline when viewed from
-       above (intersection() the added feature with a tall extrusion of the base's
-       footprint is a robust way to guarantee this:
-       intersection() { added_feature(); scale([1,1,1000]) import(path); } for plates).
+       above — verify positions against the provided cross-sections. NEVER "clip to the
+       footprint" with scale([1,1,big]) import(...): z-scaling stretches the BOTTOM
+       slice, not the outline, and collapses clipped parts into slivers. If you truly
+       need the outline, linear_extrude(h) projection() import(path) is correct but
+       slow; picking coordinates from the cross-sections is almost always better.
     c. Engraving (difference) is safer than raising on irregular surfaces — prefer it
        when the request allows.
     d. Only difference()/subtract from the imported base mesh when the user's request
