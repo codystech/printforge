@@ -769,7 +769,8 @@ async def organic(req: OrganicRequest):
     out = img.with_suffix(".stl")
     async with _organic_lock:  # never share the 3090 between two generations
         await _free_gpu()
-        env = {**os.environ, "LD_LIBRARY_PATH": "/run/opengl-driver/lib"}
+        env = {**os.environ,
+               "LD_LIBRARY_PATH": os.environ.get("ORGANIC_LIBS", "/run/opengl-driver/lib")}
         proc = await asyncio.to_thread(
             subprocess.run,
             [str(ORGANIC_DIR / ".venv/bin/python"), str(ORGANIC_DIR / "generate.py"),
