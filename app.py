@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from parts import split_parts, write_3mf
+from parts import floating_starts, split_parts, write_3mf
 from prompts import SYSTEM_PROMPT, qa_prompt, user_prompt
 
 # "codex" shells out to the codex CLI (gpt-5.5, host only) and falls back to HTTP on failure
@@ -270,6 +270,19 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
                 "when asked for). If they did not, that is damage — return a corrected file "
                 "that preserves the base."
             )
+    try:
+        floats = await asyncio.to_thread(floating_starts, stl)
+    except Exception:
+        floats = []
+    if floats:
+        desc = "; ".join(f"z={f['z']} at ({f['x']},{f['y']}) ~{f['area']}mm2" for f in floats[:8])
+        qa_notes.append(
+            f"PRINTABILITY: {len(floats)} feature(s) begin in MID-AIR when sliced bottom-up: "
+            f"{desc}. Slicers reject these. Fix each by extending the feature downward until "
+            "it fuses with whatever is below it (embed 2-3mm into the surface), or give it a "
+            ">=45-degree self-supporting underside. A ball sitting on a post tip is fine; "
+            "ignore those."
+        )
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png"))
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340"))
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
@@ -523,8 +536,12 @@ async def generate(req: GenerateRequest):
             qa = f"fixed x{fixes}"
 
     model_id = save_to_library(req.prompt, scad, stl)
+    try:
+        warnings = len(await asyncio.to_thread(floating_starts, stl))
+    except Exception:
+        warnings = 0
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,
-            "qa": qa, "model_id": model_id}
+            "qa": qa, "model_id": model_id, "print_warnings": warnings}
 
 
 @app.post("/render")

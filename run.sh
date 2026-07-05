@@ -7,4 +7,5 @@ export LLM_BACKEND="${LLM_BACKEND:-codex}"
 exec nix shell nixpkgs#openscad-unstable --command \
   uv run --with fastapi --with uvicorn --with httpx --with trimesh --with numpy --with scipy \
          --with python-multipart --with networkx --with lxml \
+         --with shapely --with rtree \
   uvicorn app:app --host 0.0.0.0 --port 8093

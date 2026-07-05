@@ -55,6 +55,31 @@ def write_3mf(parts: list[tuple[str, trimesh.Trimesh]], out_path: str | Path) ->
     return out_path
 
 
+def floating_starts(stl_path, step=1.0, min_area=0.5, tol=0.6):
+    """Slice bottom-up and report cross-section islands that appear with nothing
+    beneath them — the 'floating regions' slicers refuse to print."""
+    import numpy as np
+    m = trimesh.load_mesh(str(stl_path))
+    z0, z1 = m.bounds[0][2], m.bounds[1][2]
+    prev = None
+    out = []
+    for z in np.arange(z0 + step / 2, z1, step):
+        sec = m.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+        if sec is None:
+            prev = None
+            continue
+        planar, T = sec.to_2D()
+        polys = [p for p in planar.polygons_full if p is not None and p.area > min_area]
+        if prev is not None:
+            for p in polys:
+                if not any(p.intersects(q.buffer(tol)) for q in prev):
+                    c = (T @ np.array([p.centroid.x, p.centroid.y, 0, 1.0]))[:3]
+                    out.append({"z": round(float(z), 1), "x": round(float(c[0]), 1),
+                                "y": round(float(c[1]), 1), "area": round(float(p.area), 1)})
+        prev = polys
+    return out
+
+
 if __name__ == "__main__":
     # self-check: two disjoint cubes split into two named parts and survive a 3MF round-trip
     import tempfile

@@ -225,9 +225,10 @@ async function generate(fresh) {
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
     const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId });
-    const qaMsg = r.qa === 'passed' ? 'vision check: passed'
+    let qaMsg = r.qa === 'passed' ? 'vision check: passed'
       : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
       : '';
+    if (r.print_warnings) qaMsg += ` — ⚠ ${r.print_warnings} floating spot(s), refine to fix or slice with supports`;
     $('prompt').value = '';
     clearImage();
     clearMesh();
