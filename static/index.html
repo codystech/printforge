@@ -44,7 +44,22 @@
 </head>
 <body>
 <div id="panel">
-  <h1>Print<span>Forge</span></h1>
+  <h1 style="display:flex;justify-content:space-between;align-items:center">Print<span style="flex:1">Forge</span><button id="helpbtn" class="secondary" style="padding:2px 10px;font-size:13px" title="how everything works">?</button></h1>
+  <div id="helpbox" style="display:none;font-size:12px;line-height:1.5;background:#14161a;border:1px solid #3a3f48;border-radius:6px;padding:10px;color:#ccd">
+    <b>Four ways to make a model</b><br>
+    ✦ <b>Words → part</b>: describe it, hit <b>✍ Spec</b>, fix the ASSUMPTIONS lines, then <i>Generate from spec</i>. (Plain Generate skips the review.)<br>
+    ✦ <b>Remix a model</b>: attach a base via 📦 (file), 🔗 (Printables/Thingiverse link), then describe changes.<br>
+    ✦ <b>Sculpt a photo</b>: 🧬 + a photo of ONE object on a plain background → real 3D mesh on your GPU (1–3 min, stylized).<br>
+    ✦ <b>Logo → part</b>: drop a black-on-white logo image on 📦 — it traces to smooth curves you can extrude.<br><br>
+    <b>Buttons</b><br>
+    📷 reference image for the AI (inspiration, not geometry) · 📦 base model file / logo · 🔗 import by URL · 🧬 photo→sculpture · number box = sculpt size in mm<br><br>
+    <b>After it generates</b><br>
+    Sliders re-render live · type again + <b>Refine</b> = edit this model · <b>New model</b> = start over · <b>STL</b> single file · <b>3MF (parts)</b> = separate colorable parts for AMS · <b>→ Bambuddy</b> uploads to your archive.<br><br>
+    <b>Status line decoder</b><br>
+    "vision check: fixed ×N" = the AI caught and repaired its own mistakes · "⚠ floating spots" = slice with tree supports or ask a refine to fix · "⚠ local fallback model" = codex is rate-limited, expect crude results — regenerate later.<br><br>
+    <b>Prompting tips</b><br>
+    Name locations ("on the front face", "behind the wheel") · give real measurements when fit matters · batch related changes in one refine · after many refines, rebuild clean from the base in one big prompt · rate everything 👍/👎 — liked models teach future generations your style.
+  </div>
   <div id="chips">
     <button data-p="a gridfinity bin, 2x1 cells, 3 units tall, with a label lip">gridfinity bin</button>
     <button data-p="a 12oz can holder mug with a sturdy handle and the name CODY embossed on the side">can holder + name</button>
@@ -54,12 +69,12 @@
   </div>
   <textarea id="prompt" placeholder="Describe a model… once one exists, typing here refines it. Attach a photo/sketch below for reference."></textarea>
   <div id="imgrow">
-    <button id="imgbtn" class="secondary" type="button">📷 image</button>
+    <button id="imgbtn" class="secondary" type="button" title="reference photo/sketch: the AI looks at it for inspiration">📷 image</button>
     <input id="imgfile" type="file" accept="image/*" hidden>
     <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
-    <button id="meshbtn" class="secondary" type="button">📦 base model</button>
+    <button id="meshbtn" class="secondary" type="button" title="attach an STL/3MF/OBJ to remix, or a logo image to trace">📦 base model</button>
     <input id="meshfile" type="file" accept=".stl,.3mf,.obj,.svg,image/png,image/jpeg" hidden>
-    <button id="linkbtn" class="secondary" type="button">🔗</button>
+    <button id="linkbtn" class="secondary" type="button" title="import a model from a Printables/Thingiverse link">🔗</button>
     <button id="orgbtn" class="secondary" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)">🧬</button>
     <input id="orgfile" type="file" accept="image/*" hidden>
     <input id="orgsize" type="number" value="80" min="10" max="250" hidden style="width:52px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:4px" title="target size (mm)">
@@ -73,9 +88,9 @@
   <div id="status"></div>
   <div id="params"></div>
   <div class="btnrow">
-    <button id="download" class="secondary" hidden>STL</button>
-    <button id="download3mf" class="secondary" hidden>3MF (parts)</button>
-    <button id="send" class="secondary" hidden>→ Bambuddy</button>
+    <button id="download" class="secondary" hidden title="single-file STL">STL</button>
+    <button id="download3mf" class="secondary" hidden title="split into separate parts, each pre-colored for AMS">3MF (parts)</button>
+    <button id="send" class="secondary" hidden title="upload the 3MF to your Bambuddy archive">→ Bambuddy</button>
   </div>
   <details hidden id="codebox"><summary>OpenSCAD source</summary><pre id="code"></pre></details>
   <details id="libbox"><summary>Library</summary><div id="lib"></div></details>
@@ -121,7 +136,13 @@ resize();
 camera.up.set(0, 0, 1);
 camera.position.set(240, -180, 160);
 controls.target.set(128, 128, 0);
-(function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+let needsRender = true;
+controls.addEventListener('change', () => { needsRender = true; });
+window.addEventListener('resize', () => { needsRender = true; });
+(function animate() {
+  requestAnimationFrame(animate);
+  if (controls.update() || needsRender) { renderer.render(scene, camera); needsRender = false; }
+})();
 
 const loader = new STLLoader();
 async function showStl(id, fit) {
@@ -130,6 +151,7 @@ async function showStl(id, fit) {
   if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
   mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xe8734a, roughness: 0.55, metalness: 0.05 }));
   scene.add(mesh);
+  needsRender = true;
   if (fit) {
     geo.computeBoundingSphere();
     const { center, radius } = geo.boundingSphere;
@@ -246,6 +268,15 @@ async function generate(fresh) {
 }
 $('go').onclick = () => generate(!scad);
 $('new').onclick = () => generate(true);
+$('helpbtn').onclick = () => {
+  const h = $('helpbox');
+  h.style.display = h.style.display === 'none' ? 'block' : 'none';
+};
+// first visit: open help automatically
+if (!localStorage.getItem('pf_seen_help')) {
+  $('helpbox').style.display = 'block';
+  localStorage.setItem('pf_seen_help', '1');
+}
 
 // --- spec preview ---
 $('specbtn').onclick = async () => {
