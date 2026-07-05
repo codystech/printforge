@@ -26,6 +26,7 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:4000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-brain-coder")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "dummy")
 QA_CHECK = os.environ.get("QA_CHECK", "1") == "1"  # vision self-check, codex backend only
+QA_ROUNDS = int(os.environ.get("QA_ROUNDS", "2"))  # max look-fix-rerender iterations
 BAMBUDDY_URL = os.environ.get("BAMBUDDY_URL", "http://192.168.1.50:8000")
 BAMBUDDY_API_KEY = os.environ.get("BAMBUDDY_API_KEY", "")
 OPENSCAD_TIMEOUT = 60  # seconds; complex models can be slow
@@ -378,10 +379,20 @@ async def generate(req: GenerateRequest):
 
     qa = "skipped"
     if LLM_BACKEND == "codex" and QA_CHECK:
-        try:
-            scad, stl, qa = await vision_qa(req.prompt, scad, stl)
-        except Exception as e:
-            print(f"vision QA failed: {e}")
+        fixes = 0
+        for _ in range(QA_ROUNDS):
+            try:
+                scad, stl, status = await vision_qa(req.prompt, scad, stl)
+            except Exception as e:
+                print(f"vision QA failed: {e}")
+                qa = f"fixed x{fixes}" if fixes else "skipped"
+                break
+            if status != "fixed":
+                qa = f"fixed x{fixes}" if fixes else status
+                break
+            fixes += 1
+        else:
+            qa = f"fixed x{fixes}"
 
     model_id = save_to_library(req.prompt, scad, stl)
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,

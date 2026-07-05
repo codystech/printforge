@@ -107,9 +107,11 @@ def qa_prompt(request: str, scad: str) -> str:
         "You are reviewing a 3D-printable OpenSCAD model. The attached images are "
         "renders (isometric and top view) of the code below.\n\n"
         f"Original request: {request}\n\nOpenSCAD code:\n{scad}\n\n"
-        "First verify EVERY feature the request asks for is actually present and visible "
-        "in at least one render — a requested feature you cannot see anywhere is a defect, "
-        "not a pass. Then check: missing features, parts carved away by "
+        "Step 1: list every element/change the request demands. Step 2: for EACH one, "
+        "verify it is present in the renders, sensibly placed, and proportioned to the "
+        "model — an element you cannot see, or that is comically mis-scaled or floating, "
+        "is a defect. Reply OK only if every requested element passes. "
+        "Then check: missing features, parts carved away by "
         "CSG ordering mistakes, overlapping/fused parts that should be separate, floating "
         "geometry, unprintable overhangs. Scrutinize added text/features on imported "
         "meshes hardest: every added solid must visibly fuse into the base body (no "
@@ -130,7 +132,12 @@ def user_prompt(request: str, current_scad: str | None, mesh_note: str | None = 
             f"Current OpenSCAD file:\n{current_scad}\n\n"
             "The attached images (if any) are renders of this current model.\n"
             f"Modification request: {request}\n"
-            "Apply the change decisively and return the complete updated file."
+            "Apply the change decisively and return the complete updated file. If the "
+            "request ADDS new elements (figures, objects, decorations), actually model "
+            "each one as its own module with its own customizer variables (size, "
+            "position), sized proportionally to the base model. Stylized/blocky is fine "
+            "at small scale — invisible or omitted is not. Position additions using the "
+            "base mesh cross-sections/bounding box so they sit ON surfaces, not in air."
         )
     else:
         parts.append(f"Create a 3D-printable model: {request}")

@@ -225,7 +225,9 @@ async function generate(fresh) {
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
     const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId });
-    const qaMsg = { passed: 'vision check: passed', fixed: 'vision check: fixed an issue', skipped: '' }[r.qa] ?? '';
+    const qaMsg = r.qa === 'passed' ? 'vision check: passed'
+      : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
+      : '';
     $('prompt').value = '';
     clearImage();
     clearMesh();
