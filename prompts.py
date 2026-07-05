@@ -30,10 +30,31 @@ Rules — follow ALL of them:
     proportions as printable geometry, inferring reasonable millimeter dimensions.
 13. When a BASE MESH file is provided, build on it with import("<given path>") — never
     re-model the base shape from primitives. The prompt states its exact bounding box;
-    position added features using those coordinates. Raised text/logos: union a
-    linear_extrude that intersects the surface by ~0.6mm. Engraved: difference. Keep
-    customizer variables for what you add (text, size, depth, position offsets).
-    Rotate/translate the import only if the user asks.
+    position added features using those coordinates. Keep customizer variables for what
+    you add (text, size, depth, position offsets). Rotate/translate the import only if
+    the user asks. CRITICAL fusion rules — the bounding box max-Z is the GLOBAL top;
+    local surface height varies (thin plates, tall bosses):
+    a. Raised text/features must START INSIDE THE BODY: begin the extrusion at or below
+       the base's mid-height (e.g. z = bbox_min.z + 1) and extend up through the surface
+       to the desired raise. Never place a feature at bbox max-Z assuming a surface is
+       there.
+    b. Everything you add must sit fully INSIDE the base's outline when viewed from
+       above (intersection() the added feature with a tall extrusion of the base's
+       footprint is a robust way to guarantee this:
+       intersection() { added_feature(); scale([1,1,1000]) import(path); } for plates).
+    c. Engraving (difference) is safer than raising on irregular surfaces — prefer it
+       when the request allows.
+    d. For raised text on a VERTICAL side of an imported mesh, use EXACTLY this verified
+       recipe (do not derive your own rotations — orientation algebra is error-prone):
+       // readable from +Y; y_start just OUTSIDE the surface, depth crosses INTO the body
+       module label_plus_y(txt, sz, x, z, y_start, depth)
+           translate([x, y_start, z]) rotate([90,0,0]) mirror([1,0,0])
+               linear_extrude(depth)
+                   text(txt, size=sz, halign="center", valign="center");
+       // -Y side: mirror([0,1,0]) label_plus_y(...);
+       // X-facing sides: rotate([0,0,90]) or ([0,0,-90]) around the whole construct.
+       Pick y_start = (surface y at that height, from the cross-sections) + raise, and
+       depth = raise + at least 4 so the text always fuses into the curved surface.
 
 Example 1 — "a wall bracket with two screw holes":
 width = 60; // [20:150]
@@ -86,9 +107,15 @@ def qa_prompt(request: str, scad: str) -> str:
         "You are reviewing a 3D-printable OpenSCAD model. The attached images are "
         "renders (isometric and top view) of the code below.\n\n"
         f"Original request: {request}\n\nOpenSCAD code:\n{scad}\n\n"
-        "Check the renders against the request: missing features, parts carved away by "
+        "First verify EVERY feature the request asks for is actually present and visible "
+        "in at least one render — a requested feature you cannot see anywhere is a defect, "
+        "not a pass. Then check: missing features, parts carved away by "
         "CSG ordering mistakes, overlapping/fused parts that should be separate, floating "
-        "geometry, unprintable overhangs. If the model is correct, reply with exactly: OK\n"
+        "geometry, unprintable overhangs. Scrutinize added text/features on imported "
+        "meshes hardest: every added solid must visibly fuse into the base body (no "
+        "hovering above thin surfaces, no parts sticking past the base outline with "
+        "nothing beneath). Check the front elevation render for air gaps under features. "
+        "If the model is correct, reply with exactly: OK\n"
         "If it has defects, reply with ONLY the complete corrected OpenSCAD file "
         "(same customizer-variable conventions, no prose, no markdown fences)."
     )

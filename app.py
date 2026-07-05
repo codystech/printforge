@@ -148,11 +148,11 @@ def render_stl(scad: str, params: dict) -> Path:
 
 
 def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
-               imgsize: str = "800,600") -> Path | None:
+               imgsize: str = "800,600", ortho: bool = True) -> Path | None:
     cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(out_png), "--imgsize", imgsize,
            "--autocenter", "--viewall"]
     if camera:
-        cmd += ["--camera", camera, "--projection", "o"]
+        cmd += ["--camera", camera, "--projection", "o" if ortho else "p"]
     cmd.append(str(scad_path))
     try:
         subprocess.run(cmd, capture_output=True, timeout=OPENSCAD_TIMEOUT)
@@ -163,10 +163,15 @@ def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
 
 async def vision_qa(prompt: str, scad: str, stl: Path) -> tuple[str, Path, str]:
     """One round of render-and-review; returns (scad, stl, qa_status)."""
+    # oblique perspective views: straight-on orthographic hides low relief entirely
     scad_path = WORK_DIR / f"{stl.stem}.scad"
     iso = render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png")
     top = render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340")
-    images = [str(p) for p in (iso, top) if p]
+    ob1 = render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
+                     camera="0,0,0,70,0,25,340", ortho=False, imgsize="1000,750")
+    ob2 = render_png(scad_path, WORK_DIR / f"{stl.stem}_ob2.png",
+                     camera="0,0,0,70,0,205,340", ortho=False, imgsize="1000,750")
+    images = [str(p) for p in (iso, top, ob1, ob2) if p]
     if not images:
         return scad, stl, "skipped"
     reply = await asyncio.to_thread(
@@ -197,12 +202,10 @@ def save_to_library(prompt: str, scad: str, stl: Path) -> str:
     return model_id
 
 
-@app.post("/upload-mesh")
-async def upload_mesh(file: UploadFile = File(...)):
-    ext = Path(file.filename or "m.stl").suffix.lower()
+def _register_mesh(raw: bytes, filename: str) -> dict:
+    ext = Path(filename or "m.stl").suffix.lower()
     if ext not in {".stl", ".3mf", ".obj"}:
-        raise HTTPException(415, "upload .stl, .3mf or .obj")
-    raw = await file.read()
+        raise HTTPException(415, "only .stl, .3mf or .obj meshes")
     if len(raw) > 100_000_000:
         raise HTTPException(413, "mesh too large")
     mesh_id = uuid.uuid4().hex[:12]
@@ -217,11 +220,103 @@ async def upload_mesh(file: UploadFile = File(...)):
     m.export(stl_path)
     if tmp != stl_path:
         tmp.unlink()
-    meta = {"id": mesh_id, "name": file.filename,
+    # horizontal cross-sections so the LLM knows where surfaces actually are per height
+    sections = []
+    z0, z1 = m.bounds[0][2], m.bounds[1][2]
+    for frac in (0.1, 0.3, 0.5, 0.7, 0.9):
+        z = z0 + frac * (z1 - z0)
+        try:
+            s = m.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+            if s is not None:
+                b = s.bounds
+                sections.append({"z": round(z, 1),
+                                 "x": [round(b[0][0], 1), round(b[1][0], 1)],
+                                 "y": [round(b[0][1], 1), round(b[1][1], 1)]})
+        except Exception:
+            pass
+    meta = {"id": mesh_id, "name": filename,
             "bounds_min": [round(v, 1) for v in m.bounds[0]],
-            "bounds_max": [round(v, 1) for v in m.bounds[1]]}
+            "bounds_max": [round(v, 1) for v in m.bounds[1]],
+            "sections": sections}
     (UPLOADS_DIR / f"{mesh_id}.json").write_text(json.dumps(meta))
     return meta
+
+
+@app.post("/upload-mesh")
+async def upload_mesh(file: UploadFile = File(...)):
+    return _register_mesh(await file.read(), file.filename or "m.stl")
+
+
+class ImportUrlRequest(BaseModel):
+    url: str
+
+
+PRINTABLES_GQL = "https://api.printables.com/graphql/"
+UA = {"User-Agent": "Mozilla/5.0 (PrintForge)"}
+
+
+async def _printables_import(model_id: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
+    q = f'query {{ print(id: "{model_id}") {{ name stls {{ id name fileSize }} }} }}'
+    r = await client.post(PRINTABLES_GQL, headers=UA, json={"query": q})
+    data = (r.json().get("data") or {}).get("print")
+    if not data or not data.get("stls"):
+        raise HTTPException(404, "no STL files on that Printables model")
+    stl = max(data["stls"], key=lambda s: s.get("fileSize") or 0)
+    mq = (f'mutation {{ getDownloadLink(id: "{stl["id"]}", printId: "{model_id}", '
+          f'fileType: stl, source: model_detail) {{ ok output {{ link }} }} }}')
+    r = await client.post(PRINTABLES_GQL, headers=UA, json={"query": mq})
+    link = ((r.json().get("data") or {}).get("getDownloadLink") or {}).get("output", {}).get("link")
+    if not link:
+        raise HTTPException(502, "Printables did not return a download link")
+    dl = await client.get(link, headers=UA, follow_redirects=True)
+    return dl.content, stl["name"]
+
+
+async def _thingiverse_import(thing_id: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
+    token = os.environ.get("THINGIVERSE_TOKEN", "")
+    if not token:
+        raise HTTPException(400, "Thingiverse needs THINGIVERSE_TOKEN — create a free app "
+                                 "token at thingiverse.com/developers and add it to .env")
+    auth = {"Authorization": f"Bearer {token}", **UA}
+    r = await client.get(f"https://api.thingiverse.com/things/{thing_id}/files", headers=auth)
+    files = [f for f in r.json() if f.get("name", "").lower().endswith((".stl", ".obj", ".3mf"))]
+    if not files:
+        raise HTTPException(404, "no mesh files on that thing")
+    f = max(files, key=lambda x: x.get("size") or 0)
+    dl = await client.get(f["download_url"], headers=auth, follow_redirects=True)
+    return dl.content, f["name"]
+
+
+@app.post("/import-url")
+async def import_url(req: ImportUrlRequest):
+    url = req.url.strip()
+    host = (httpx.URL(url).host or "").lower()
+    async with httpx.AsyncClient(timeout=120) as client:
+        if "printables.com" in host:
+            m = re.search(r"/model/(\d+)", url)
+            if not m:
+                raise HTTPException(400, "use a printables.com/model/<id>-… link")
+            raw, name = await _printables_import(m.group(1), client)
+        elif "thingiverse.com" in host:
+            m = re.search(r"thing:(\d+)|/thing/(\d+)", url)
+            if not m:
+                raise HTTPException(400, "use a thingiverse.com/thing:<id> link")
+            raw, name = await _thingiverse_import(m.group(1) or m.group(2), client)
+        elif "makerworld" in host:
+            raise HTTPException(400, "MakerWorld has no public API — download the model "
+                                     "with Bambu Studio or your browser, then attach the "
+                                     "file with the \U0001F4E6 button")
+        elif "cults3d.com" in host or "myminifactory.com" in host:
+            raise HTTPException(400, "that site needs a login/API key for downloads — "
+                                     "download the file in your browser, then attach it "
+                                     "with the \U0001F4E6 button")
+        elif url.lower().split("?")[0].endswith((".stl", ".3mf", ".obj")):
+            dl = await client.get(url, headers=UA, follow_redirects=True)
+            raw, name = dl.content, Path(httpx.URL(url).path).name
+        else:
+            raise HTTPException(400, "unsupported link — paste a Printables/Thingiverse "
+                                     "model URL or a direct .stl/.3mf/.obj link")
+    return _register_mesh(raw, name)
 
 
 def _mesh_note(mesh_id: str) -> str:
@@ -232,9 +327,16 @@ def _mesh_note(mesh_id: str) -> str:
         raise HTTPException(404, "mesh not found")
     meta = json.loads(meta_file.read_text())
     path = (UPLOADS_DIR / f"{mesh_id}.stl").resolve()
+    secs = "".join(
+        f"\n  at z={s['z']}: x {s['x'][0]}..{s['x'][1]}, y {s['y'][0]}..{s['y'][1]}"
+        for s in meta.get("sections", [])
+    )
     return (
         f'BASE MESH provided ("{meta["name"]}"): import("{path}");\n'
-        f"Its bounding box is min {meta['bounds_min']} to max {meta['bounds_max']} mm (x,y,z)."
+        f"Bounding box: min {meta['bounds_min']} to max {meta['bounds_max']} mm (x,y,z).\n"
+        f"Horizontal cross-section extents (the body only exists within these at each height):{secs}\n"
+        "Place features ONLY where these sections show material at that height, and start "
+        "them inside the section extents so they fuse."
     )
 
 

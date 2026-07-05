@@ -59,8 +59,10 @@
     <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
     <button id="meshbtn" class="secondary" type="button">📦 base model</button>
     <input id="meshfile" type="file" accept=".stl,.3mf,.obj" hidden>
+    <button id="linkbtn" class="secondary" type="button">🔗</button>
     <span id="meshchip" style="display:none;align-items:center;gap:6px;font-size:12px;color:#aab"><span id="meshname"></span><b id="meshclear" style="cursor:pointer;color:#ff7b72">✕</b></span>
   </div>
+  <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" style="display:none;width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px">
   <button id="go">Generate</button>
   <button id="new" class="secondary" hidden>New model (start fresh)</button>
   <div id="status"></div>
@@ -270,12 +272,31 @@ $('meshfile').onchange = async () => {
   try {
     const r = await fetch('/upload-mesh', { method: 'POST', body: fd });
     if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
-    const m = await r.json();
-    meshId = m.id;
-    $('meshname').textContent = `📦 ${m.name}`;
-    $('meshchip').style.display = 'inline-flex';
-    setStatus('base model attached — describe what to add or change', 'good');
+    attachMesh(await r.json());
   } catch (e) { setStatus(e.message, 'error'); }
+};
+
+function attachMesh(m) {
+  meshId = m.id;
+  $('meshname').textContent = `📦 ${m.name}`;
+  $('meshchip').style.display = 'inline-flex';
+  setStatus('base model attached — describe what to add or change', 'good');
+}
+$('linkbtn').onclick = () => {
+  const li = $('linkinput');
+  li.style.display = li.style.display === 'none' ? 'block' : 'none';
+  if (li.style.display === 'block') li.focus();
+};
+$('linkinput').onkeydown = async e => {
+  if (e.key !== 'Enter') return;
+  const url = $('linkinput').value.trim();
+  if (!url) return;
+  setBusyStatus('Fetching model…');
+  try {
+    attachMesh(await api('/import-url', { url }));
+    $('linkinput').value = '';
+    $('linkinput').style.display = 'none';
+  } catch (err) { setStatus(err.message, 'error'); }
 };
 
 document.addEventListener('paste', e => {
