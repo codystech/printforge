@@ -346,7 +346,7 @@ $('orgfile').onchange = () => {
     try {
       const m = await api('/organic', { image: rd.result, target_mm: parseFloat($('orgsize').value) || 80 });
       attachMesh(m);
-      setStatus('sculpted mesh attached — describe changes or personalization', 'good');
+      await showModel(m, 'sculpted! download it, or type a refine to personalize it', 'good');
     } catch (e) { setStatus(e.message, 'error'); }
   };
   rd.readAsDataURL(f);

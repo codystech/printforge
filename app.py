@@ -781,7 +781,14 @@ async def organic(req: OrganicRequest):
             capture_output=True, text=True, timeout=720, env=env)
     if proc.returncode != 0 or not out.exists():
         raise HTTPException(502, f"organic generation failed:\n{(proc.stderr or '')[-800:]}")
-    return _register_mesh(out.read_bytes(), "organic.stl")
+    meta = _register_mesh(out.read_bytes(), "organic.stl")
+    # instantly viewable/exportable — no LLM round-trip needed to see the sculpt
+    stl_id = uuid.uuid4().hex
+    shutil.copy(UPLOADS_DIR / f"{meta['id']}.stl", WORK_DIR / f"{stl_id}.stl")
+    wrapper = (f'base_mesh_path = "{(UPLOADS_DIR / (meta["id"] + ".stl")).resolve()}"; // free text\n'
+               "// --- model ---\nimport(base_mesh_path, convexity=10);\n")
+    meta.update({"stl_id": stl_id, "scad": wrapper, "params": parse_params(wrapper)})
+    return meta
 
 
 @app.get("/config")
