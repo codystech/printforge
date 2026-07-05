@@ -106,6 +106,31 @@ def call_codex(messages: list[dict], images: list[str] | None = None) -> str:
     return strip_fences(out.read_text())
 
 
+def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None) -> str:
+    """Have codex EDIT the file in a scratch workspace instead of re-printing it —
+    wholesale rewrites of long files reliably drop unrelated features."""
+    job = WORK_DIR / f"edit-{uuid.uuid4().hex}"
+    job.mkdir()
+    f = job / "model.scad"
+    f.write_text(scad)
+    prompt = (
+        f"{instruction}\n\n"
+        "Apply your changes by EDITING model.scad in this directory with precise, "
+        "minimal edits. Every module, feature and parameter not affected by the request "
+        "must survive byte-for-byte. Never rewrite the file from scratch. If no change "
+        "is needed, edit nothing."
+    )
+    cmd = ["codex", "exec", "-C", str(job), "-s", "workspace-write",
+           "--skip-git-repo-check", "--ephemeral"]
+    for img in images or []:
+        cmd += ["-i", img]
+    cmd.append("-")
+    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=420)
+    if proc.returncode != 0:
+        raise RuntimeError(f"codex edit failed: {proc.stderr[-500:]}")
+    return f.read_text()
+
+
 async def call_llm(messages: list[dict], images: list[str] | None = None) -> str:
     if LLM_BACKEND == "codex":
         try:
@@ -254,17 +279,17 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     images = [str(p) for p in views if p]
     if not images:
         return scad, stl, "skipped"
-    reply = await asyncio.to_thread(
-        call_codex, [{"role": "user", "content": qa_prompt(prompt, scad, qa_notes)}], images
+    edited = await asyncio.to_thread(
+        call_codex_edit, scad,
+        qa_prompt(prompt, "(the code is model.scad in this directory)", qa_notes), images
     )
-    if reply.strip() == "OK":
+    if edited.strip() == scad.strip():
         return scad, stl, "passed"
-    fixed = strip_fences(reply)
     try:
-        fixed_stl = render_stl(fixed, {})
+        fixed_stl = render_stl(edited, {})
     except HTTPException:
         return scad, stl, "passed"  # ponytail: fix didn't render, ship the original
-    return fixed, fixed_stl, "fixed"
+    return edited, fixed_stl, "fixed"
 
 
 def save_to_library(prompt: str, scad: str, stl: Path) -> str:
@@ -440,25 +465,48 @@ async def generate(req: GenerateRequest):
             if p:
                 images.append(str(p))
     mesh_note = _mesh_note(req.mesh_id) if req.mesh_id else None
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
-    ]
-    scad = await call_llm(messages, images)
-    # validate by rendering; on failure, one automatic retry with the error fed back
-    try:
-        stl = render_stl(scad, {})
-    except HTTPException as e:
-        messages += [
-            {"role": "assistant", "content": scad},
-            {"role": "user", "content": f"That code failed to render:\n{e.detail}\nFix it and return the complete corrected file."},
+    if req.current_scad and LLM_BACKEND == "codex":
+        # refines edit the existing file in place — reprinting long files wholesale
+        # reliably drops unrelated features
+        instruction = SYSTEM_PROMPT + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+            "The attached images (if any) are renders of the current model and/or a "
+            f"user-provided reference photo.\nModification request: {req.prompt}"
+        )
+        scad = await asyncio.to_thread(call_codex_edit, req.current_scad, instruction, images)
+        try:
+            stl = render_stl(scad, {})
+        except HTTPException as e:
+            scad = await asyncio.to_thread(
+                call_codex_edit, scad,
+                f"The file fails to render with this error:\n{e.detail}\nFix it.")
+            stl = render_stl(scad, {})  # second failure propagates to the UI
+    else:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
         scad = await call_llm(messages, images)
-        stl = render_stl(scad, {})  # second failure propagates to the UI
+        # validate by rendering; on failure, one automatic retry with the error fed back
+        try:
+            stl = render_stl(scad, {})
+        except HTTPException as e:
+            messages += [
+                {"role": "assistant", "content": scad},
+                {"role": "user", "content": f"That code failed to render:\n{e.detail}\nFix it and return the complete corrected file."},
+            ]
+            scad = await call_llm(messages, images)
+            stl = render_stl(scad, {})  # second failure propagates to the UI
 
     qa = "skipped"
     if LLM_BACKEND == "codex" and QA_CHECK:
+        # diff against the PREVIOUS state for refines, not the pristine upload —
+        # otherwise QA re-litigates (and reverts) intentional changes from earlier turns
         base_stl = (UPLOADS_DIR / f"{req.mesh_id}.stl") if req.mesh_id else None
+        if req.current_scad:
+            try:
+                base_stl = render_stl(req.current_scad, {})
+            except HTTPException:
+                pass  # unrenderable previous state; fall back to the upload
         fixes = 0
         for _ in range(QA_ROUNDS):
             try:

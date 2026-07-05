@@ -122,16 +122,14 @@ def qa_prompt(request: str, scad: str, notes: list[str] | None = None) -> str:
         "Step 1: list every element/change the request demands. Step 2: for EACH one, "
         "verify it is present in the renders, sensibly placed, and proportioned to the "
         "model — an element you cannot see, or that is comically mis-scaled or floating, "
-        "is a defect. Reply OK only if every requested element passes. "
-        "Then check: missing features, parts carved away by "
+        "is a defect. Then check: missing features, parts carved away by "
         "CSG ordering mistakes, overlapping/fused parts that should be separate, floating "
         "geometry, unprintable overhangs. Scrutinize added text/features on imported "
         "meshes hardest: every added solid must visibly fuse into the base body (no "
         "hovering above thin surfaces, no parts sticking past the base outline with "
-        "nothing beneath). Check the front elevation render for air gaps under features. "
-        "If the model is correct, reply with exactly: OK\n"
-        "If it has defects, reply with ONLY the complete corrected OpenSCAD file "
-        "(same customizer-variable conventions, no prose, no markdown fences)."
+        "nothing beneath). If every requested element passes and there are no defects, "
+        "make NO edits. Otherwise fix the defects with minimal edits (same "
+        "customizer-variable conventions)."
     )
 
 
@@ -150,8 +148,10 @@ def user_prompt(request: str, current_scad: str | None, mesh_note: str | None = 
             "position), sized proportionally to the base model. Stylized/blocky is fine "
             "at small scale — invisible or omitted is not. Position additions using the "
             "base mesh cross-sections/bounding box so they sit ON surfaces, not in air. "
-            "Also PRUNE: delete modules and variables that are no longer used after your "
-            "change — the file must stay coherent across many refinements."
+            "PRESERVE EVERYTHING ELSE: every module, feature and parameter not named in "
+            "the request must survive your edit verbatim. Only delete code that YOUR "
+            "change makes unused. Returning a rewritten-from-scratch file that drops "
+            "existing features is the worst possible failure."
         )
     else:
         parts.append(f"Create a 3D-printable model: {request}")
