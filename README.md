@@ -10,6 +10,16 @@ multi-part/multi-color 3MF export (one object per connected part, AMS-ready),
 model library with thumbnails (auto-saved, reload/rename/delete), photo/sketch
 input, preset chips, 256mm P1S build plate in the viewer.
 
+v3 features: SVG import + bitmap logo tracing (real curves via potrace →
+`linear_extrude(import(svg))`), ✍ Spec preview (your prompt becomes an
+editable design spec before generation), archetype guidance (gridfinity,
+hinges, clips, signs, enclosures), auto-named library entries, AMS color
+palette baked into 3MF parts, and 🧬 organic mode — Hunyuan3D-2 on the local
+3090 sculpts a mesh from a photo, which lands as a base model you can then
+personalize with the normal remix pipeline. Organic setup (one-time):
+`organic/setup.sh`. The GPU is shared with the local LLM brain: PrintForge
+unloads ollama models before sculpting; they reload lazily afterward.
+
 ## Run (primary — host, codex backend)
 
 ```sh

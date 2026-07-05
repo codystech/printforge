@@ -26,8 +26,16 @@ def split_parts(stl_path: str | Path) -> list[tuple[str, trimesh.Trimesh]]:
     return [(f"part_{i + 1}", m) for i, m in enumerate(comps)]
 
 
+# distinct default colors so multi-part models arrive in Bambu pre-differentiated
+PALETTE = ["#DA2F2F", "#F5F5F5", "#2B6CB0", "#F6C344", "#3AA655", "#2D2D2D"]
+
+
 def write_3mf(parts: list[tuple[str, trimesh.Trimesh]], out_path: str | Path) -> Path:
     objects, items = [], []
+    bases = "".join(
+        f'<base name="color{i + 1}" displaycolor="{c}"/>' for i, c in enumerate(PALETTE)
+    )
+    materials = f'<basematerials id="100">{bases}</basematerials>'
     for oid, (name, m) in enumerate(parts, start=1):
         verts = "".join(
             f'<vertex x="{v[0]:.4f}" y="{v[1]:.4f}" z="{v[2]:.4f}"/>' for v in m.vertices
@@ -35,8 +43,9 @@ def write_3mf(parts: list[tuple[str, trimesh.Trimesh]], out_path: str | Path) ->
         tris = "".join(
             f'<triangle v1="{f[0]}" v2="{f[1]}" v3="{f[2]}"/>' for f in m.faces
         )
+        pindex = (oid - 1) % len(PALETTE)
         objects.append(
-            f'<object id="{oid}" name="{name}" type="model">'
+            f'<object id="{oid}" name="{name}" type="model" pid="100" pindex="{pindex}">'
             f"<mesh><vertices>{verts}</vertices><triangles>{tris}</triangles></mesh></object>"
         )
         items.append(f'<item objectid="{oid}"/>')
@@ -44,7 +53,7 @@ def write_3mf(parts: list[tuple[str, trimesh.Trimesh]], out_path: str | Path) ->
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<model unit="millimeter" xml:lang="en-US" '
         'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
-        f"<resources>{''.join(objects)}</resources>"
+        f"<resources>{materials}{''.join(objects)}</resources>"
         f"<build>{''.join(items)}</build></model>"
     )
     out_path = Path(out_path)

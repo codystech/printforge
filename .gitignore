@@ -1,4 +1,6 @@
 library/
 uploads/
+organic/.venv/
+organic/models/
 __pycache__/
 .env

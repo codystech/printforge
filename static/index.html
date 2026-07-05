@@ -58,12 +58,17 @@
     <input id="imgfile" type="file" accept="image/*" hidden>
     <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
     <button id="meshbtn" class="secondary" type="button">📦 base model</button>
-    <input id="meshfile" type="file" accept=".stl,.3mf,.obj" hidden>
+    <input id="meshfile" type="file" accept=".stl,.3mf,.obj,.svg,image/png,image/jpeg" hidden>
     <button id="linkbtn" class="secondary" type="button">🔗</button>
+    <button id="orgbtn" class="secondary" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)">🧬</button>
+    <input id="orgfile" type="file" accept="image/*" hidden>
+    <input id="orgsize" type="number" value="80" min="10" max="250" hidden style="width:52px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:4px" title="target size (mm)">
     <span id="meshchip" style="display:none;align-items:center;gap:6px;font-size:12px;color:#aab"><span id="meshname"></span><b id="meshclear" style="cursor:pointer;color:#ff7b72">✕</b></span>
   </div>
   <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" style="display:none;width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px">
-  <button id="go">Generate</button>
+  <div class="btnrow"><button id="go">Generate</button><button id="specbtn" class="secondary" title="expand your prompt into an editable design spec first">✍ Spec</button></div>
+  <textarea id="specbox" style="display:none;height:180px;font-size:12px" placeholder="design spec — edit anything, then Generate from spec"></textarea>
+  <button id="specgen" style="display:none">Generate from spec</button>
   <button id="new" class="secondary" hidden>New model (start fresh)</button>
   <div id="status"></div>
   <div id="params"></div>
@@ -241,6 +246,31 @@ async function generate(fresh) {
 $('go').onclick = () => generate(!scad);
 $('new').onclick = () => generate(true);
 
+// --- spec preview ---
+$('specbtn').onclick = async () => {
+  const prompt = $('prompt').value.trim();
+  if (!prompt) return;
+  $('specbtn').disabled = true;
+  setBusyStatus('Drafting design spec…');
+  try {
+    const r = await api('/spec', { prompt, mesh_id: meshId });
+    $('specbox').value = r.spec;
+    $('specbox').style.display = 'block';
+    $('specgen').style.display = 'block';
+    setStatus('review the spec — fix any wrong assumptions, then Generate from spec', 'good');
+  } catch (e) { setStatus(e.message, 'error'); }
+  $('specbtn').disabled = false;
+};
+$('specgen').onclick = async () => {
+  const original = $('prompt').value.trim();
+  const spec = $('specbox').value.trim();
+  if (!spec) return;
+  $('prompt').value = `${original}\n\nAPPROVED SPEC (follow it exactly):\n${spec}`;
+  $('specbox').style.display = 'none';
+  $('specgen').style.display = 'none';
+  generate(!scad);
+};
+
 // --- preset chips ---
 for (const b of $('chips').querySelectorAll('button'))
   b.onclick = () => { $('prompt').value = b.dataset.p; $('prompt').focus(); };
@@ -270,11 +300,12 @@ $('meshfile').onchange = async () => {
   const f = $('meshfile').files[0];
   if (!f) return;
   $('meshfile').value = '';
-  setBusyStatus('Uploading base model…');
+  const isBitmap = /image\/(png|jpe?g)/.test(f.type);
+  setBusyStatus(isBitmap ? 'Tracing silhouette…' : 'Uploading base model…');
   const fd = new FormData();
   fd.append('file', f);
   try {
-    const r = await fetch('/upload-mesh', { method: 'POST', body: fd });
+    const r = await fetch('/upload-mesh' + (isBitmap ? '?trace=1' : ''), { method: 'POST', body: fd });
     if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
     attachMesh(await r.json());
   } catch (e) { setStatus(e.message, 'error'); }
@@ -301,6 +332,24 @@ $('linkinput').onkeydown = async e => {
     $('linkinput').value = '';
     $('linkinput').style.display = 'none';
   } catch (err) { setStatus(err.message, 'error'); }
+};
+
+// --- organic (AI sculpt) ---
+$('orgbtn').onclick = () => $('orgfile').click();
+$('orgfile').onchange = () => {
+  const f = $('orgfile').files[0];
+  if (!f) return;
+  $('orgfile').value = '';
+  const rd = new FileReader();
+  rd.onload = async () => {
+    setBusyStatus('AI-sculpting mesh from image… (1-3 min, stylized result)');
+    try {
+      const m = await api('/organic', { image: rd.result, target_mm: parseFloat($('orgsize').value) || 80 });
+      attachMesh(m);
+      setStatus('sculpted mesh attached — describe changes or personalization', 'good');
+    } catch (e) { setStatus(e.message, 'error'); }
+  };
+  rd.readAsDataURL(f);
 };
 
 document.addEventListener('paste', e => {
@@ -376,7 +425,10 @@ async function loadLibrary() {
 
 // --- init ---
 $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('go').click(); } });
-fetch('/config').then(r => r.json()).then(c => { window.bambuddyOn = c.bambuddy; }).catch(() => {});
+fetch('/config').then(r => r.json()).then(c => {
+  window.bambuddyOn = c.bambuddy;
+  if (c.organic) { $('orgbtn').hidden = false; $('orgsize').hidden = false; }
+}).catch(() => {});
 loadLibrary();
 </script>
 </body>

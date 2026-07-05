@@ -112,6 +112,50 @@ difference() {
 """
 
 
+ARCHETYPES = {
+    ("gridfinity",):
+        "Gridfinity standard: 42.0mm grid pitch; a bin footprint is n*42-0.5mm; heights "
+        "in 7mm units; base profile ~4.75mm tall with 0.8mm bottom chamfer; stacking lip "
+        "on top mirrors the base profile.",
+    ("hinge", "hinged", "print-in-place", "print in place"):
+        "Print-in-place hinges: barrel >=8mm diameter, pin-to-barrel clearance 0.5mm, "
+        "print axis horizontal along the bed, add 45-degree teardrop tops to barrel "
+        "holes so they print without supports.",
+    ("clip", "hook", "clamp"):
+        "Clips/hooks: flex fingers 1.6-2.4mm thick along the bend direction, opening "
+        "0.5-1mm smaller than the held object, fillet the flex root, orient layers "
+        "along the flex direction (print flat).",
+    ("sign", "plaque", "logo", "emblem", "badge"):
+        "Signs/plaques: base plate 3-4mm, raised art 1.2-2mm as separate parts per color "
+        "zone laid beside the plate; text at least 6mm tall for legibility at 0.4mm "
+        "nozzle.",
+    ("box", "enclosure", "case", "container"):
+        "Boxes/enclosures: walls >=2mm, lid lip 1.5-2mm with 0.2mm clearance, inside "
+        "corners filleted, screw posts 2x screw diameter with 0.2mm pilot clearance.",
+}
+
+
+def archetype_notes(request: str) -> str:
+    req = request.lower()
+    hits = [text for keys, text in ARCHETYPES.items() if any(k in req for k in keys)]
+    return ("\n\nArchetype guidance:\n" + "\n".join(hits)) if hits else ""
+
+
+def spec_prompt(request: str, mesh_note: str | None = None) -> str:
+    return (
+        "You are a 3D-print design consultant. Expand the user's request into a compact "
+        "design spec they will review and EDIT before generation. Plain text only, no "
+        "markdown, at most ~15 short lines, using exactly these section labels:\n"
+        "TARGET: overall dimensions in mm\n"
+        "FEATURES: each feature with size and position\n"
+        "PRINT: bed orientation, support needs, wall thicknesses\n"
+        "PARTS: part/color layout if multi-part\n"
+        "ASSUMPTIONS: every guess the user should confirm or correct\n\n"
+        + (f"{mesh_note}\n\n" if mesh_note else "")
+        + f"Request: {request}"
+    )
+
+
 def qa_prompt(request: str, scad: str, notes: list[str] | None = None) -> str:
     note_block = ("\n".join(notes) + "\n\n") if notes else ""
     return (

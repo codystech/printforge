@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from parts import floating_starts, split_parts, write_3mf
-from prompts import SYSTEM_PROMPT, qa_prompt, user_prompt
+from prompts import SYSTEM_PROMPT, archetype_notes, qa_prompt, spec_prompt, user_prompt
 
 # "codex" shells out to the codex CLI (gpt-5.5, host only) and falls back to HTTP on failure
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "http")
@@ -64,6 +64,11 @@ class RenderRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     name: str
+
+
+class SpecRequest(BaseModel):
+    prompt: str
+    mesh_id: str | None = None
 
 
 def parse_params(scad: str) -> list[dict]:
@@ -348,10 +353,47 @@ def intent_block(intent: list[str]) -> str:
     )
 
 
+def _register_svg(raw: bytes, filename: str) -> dict:
+    mesh_id = uuid.uuid4().hex[:12]
+    path = UPLOADS_DIR / f"{mesh_id}.svg"
+    path.write_bytes(raw)
+    import xml.etree.ElementTree as ET
+    size = None
+    try:
+        root = ET.fromstring(raw)
+        vb = root.get("viewBox")
+        if vb:
+            _, _, w, h = (float(v) for v in vb.replace(",", " ").split())
+            size = [round(w, 1), round(h, 1)]
+        elif root.get("width") and root.get("height"):
+            size = [round(float(re.sub(r"[a-z%]+$", "", root.get(a))), 1)
+                    for a in ("width", "height")]
+    except Exception:
+        pass
+    meta = {"id": mesh_id, "name": filename, "kind": "svg", "size": size}
+    (UPLOADS_DIR / f"{mesh_id}.json").write_text(json.dumps(meta))
+    return meta
+
+
+def _trace_to_svg(raw: bytes, filename: str) -> bytes:
+    """Bitmap logo → SVG silhouette via imagemagick + potrace."""
+    job = WORK_DIR / f"trace-{uuid.uuid4().hex}"
+    src, pgm, svg = job.with_suffix(Path(filename).suffix or ".png"), job.with_suffix(".pgm"), job.with_suffix(".svg")
+    src.write_bytes(raw)
+    subprocess.run(["magick", str(src), "-colorspace", "gray", "-resize", "1000x1000>",
+                    "-threshold", "50%", str(pgm)], check=True, capture_output=True, timeout=60)
+    subprocess.run(["nix", "shell", "nixpkgs#potrace", "--command",
+                    "potrace", "-s", "-o", str(svg), str(pgm)],
+                   check=True, capture_output=True, timeout=120)
+    return svg.read_bytes()
+
+
 def _register_mesh(raw: bytes, filename: str) -> dict:
     ext = Path(filename or "m.stl").suffix.lower()
+    if ext == ".svg":
+        return _register_svg(raw, filename)
     if ext not in {".stl", ".3mf", ".obj"}:
-        raise HTTPException(415, "only .stl, .3mf or .obj meshes")
+        raise HTTPException(415, "only .stl, .3mf, .obj meshes or .svg outlines")
     if len(raw) > 100_000_000:
         raise HTTPException(413, "mesh too large")
     mesh_id = uuid.uuid4().hex[:12]
@@ -389,8 +431,16 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
 
 
 @app.post("/upload-mesh")
-async def upload_mesh(file: UploadFile = File(...)):
-    return _register_mesh(await file.read(), file.filename or "m.stl")
+async def upload_mesh(file: UploadFile = File(...), trace: bool = False):
+    raw = await file.read()
+    name = file.filename or "m.stl"
+    if trace:
+        try:
+            raw = await asyncio.to_thread(_trace_to_svg, raw, name)
+            name = Path(name).stem + ".svg"
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(422, f"tracing failed: {(e.stderr or b'')[-300:].decode(errors='replace')}")
+    return _register_mesh(raw, name)
 
 
 class ImportUrlRequest(BaseModel):
@@ -472,6 +522,17 @@ def _mesh_note(mesh_id: str) -> str:
     if not meta_file.exists():
         raise HTTPException(404, "mesh not found")
     meta = json.loads(meta_file.read_text())
+    if meta.get("kind") == "svg":
+        path = (UPLOADS_DIR / f"{mesh_id}.svg").resolve()
+        size = meta.get("size")
+        size_note = f" Its natural size is {size[0]}x{size[1]} units." if size else ""
+        return (
+            f'2D SVG OUTLINE provided ("{meta["name"]}"): use it as real curved geometry '
+            f'via linear_extrude(height) import("{path}", center=true);{size_note} '
+            "Wrap it in resize([target_w, target_h, 0], auto=true) to hit requested "
+            "dimensions, keep extrusion height and scale as customizer parameters, and "
+            "build any mounts/bosses relative to the extrusion."
+        )
     path = (UPLOADS_DIR / f"{mesh_id}.stl").resolve()
     secs = "".join(
         f"\n  at z={s['z']}: x {s['x'][0]}..{s['x'][1]}, y {s['y'][0]}..{s['y'][1]}"
@@ -484,6 +545,34 @@ def _mesh_note(mesh_id: str) -> str:
         "Place features ONLY where these sections show material at that height, and start "
         "them inside the section extents so they fuse."
     )
+
+
+@app.post("/spec")
+async def spec(req: SpecRequest):
+    mesh_note = _mesh_note(req.mesh_id) if req.mesh_id else None
+    text = await call_llm([{"role": "user", "content": spec_prompt(req.prompt, mesh_note)}])
+    return {"spec": text}
+
+
+async def _autoname(model_id: str, prompt: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={"model": LLM_MODEL, "temperature": 0.4, "messages": [{
+                    "role": "user",
+                    "content": "Reply with ONLY a short 2-4 word name for this 3D print "
+                               f"design, nothing else: {prompt[:300]}"}]},
+            )
+        name = r.json()["choices"][0]["message"]["content"].strip().strip('"').splitlines()[0][:40]
+        meta_file = LIB_DIR / model_id / "meta.json"
+        if name and meta_file.exists():
+            meta = json.loads(meta_file.read_text())
+            meta["name"] = name
+            meta_file.write_text(json.dumps(meta))
+    except Exception:
+        pass  # naming is best-effort garnish
 
 
 @app.post("/generate")
@@ -524,7 +613,7 @@ async def generate(req: GenerateRequest):
                 )
         except Exception:
             pass
-        instruction = SYSTEM_PROMPT + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
             "The attached images (if any) are renders of the current model and/or a "
             f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
@@ -539,7 +628,7 @@ async def generate(req: GenerateRequest):
             stl = render_stl(scad, {})  # second failure propagates to the UI
     else:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
         scad = await call_llm(messages, images)
@@ -582,6 +671,7 @@ async def generate(req: GenerateRequest):
 
     model_id = save_to_library(req.prompt, scad, stl,
                                load_intent(req.parent_id) + [req.prompt])
+    asyncio.create_task(_autoname(model_id, req.prompt))
     try:
         warnings = len(await asyncio.to_thread(floating_starts, stl))
     except Exception:
@@ -640,9 +730,60 @@ async def send_to_bambuddy(stl_id: str, name: str = "printforge-model"):
     return r.json()
 
 
+ORGANIC_DIR = Path(__file__).parent / "organic"
+_organic_lock = asyncio.Lock()
+
+
+def _organic_ready() -> bool:
+    return (ORGANIC_DIR / ".venv/bin/python").exists()
+
+
+class OrganicRequest(BaseModel):
+    image: str  # data URL
+    target_mm: float = 80
+
+
+async def _free_gpu():
+    """Ask ollama to unload whatever it has loaded; the brain reloads lazily later."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            ps = (await client.get("http://127.0.0.1:11434/api/ps")).json()
+            for mdl in ps.get("models", []):
+                await client.post("http://127.0.0.1:11434/api/generate",
+                                  json={"model": mdl["name"], "keep_alive": 0})
+    except Exception:
+        pass
+
+
+@app.post("/organic")
+async def organic(req: OrganicRequest):
+    if not _organic_ready():
+        raise HTTPException(503, "organic mode not installed — run organic/setup.sh once")
+    try:
+        _, b64 = req.image.split(",", 1)
+        raw = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(400, "bad image data URL")
+    img = WORK_DIR / f"org-{uuid.uuid4().hex}.png"
+    img.write_bytes(raw)
+    out = img.with_suffix(".stl")
+    async with _organic_lock:  # never share the 3090 between two generations
+        await _free_gpu()
+        env = {**os.environ, "LD_LIBRARY_PATH": "/run/opengl-driver/lib"}
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [str(ORGANIC_DIR / ".venv/bin/python"), str(ORGANIC_DIR / "generate.py"),
+             "--image", str(img), "--out", str(out),
+             "--target-mm", str(max(10.0, min(250.0, req.target_mm)))],
+            capture_output=True, text=True, timeout=720, env=env)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(502, f"organic generation failed:\n{(proc.stderr or '')[-800:]}")
+    return _register_mesh(out.read_bytes(), "organic.stl")
+
+
 @app.get("/config")
 async def config():
-    return {"bambuddy": bool(BAMBUDDY_API_KEY)}
+    return {"bambuddy": bool(BAMBUDDY_API_KEY), "organic": _organic_ready()}
 
 
 def _model_dir(model_id: str) -> Path:
