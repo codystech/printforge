@@ -44,7 +44,15 @@ Rules — follow ALL of them:
        intersection() { added_feature(); scale([1,1,1000]) import(path); } for plates).
     c. Engraving (difference) is safer than raising on irregular surfaces — prefer it
        when the request allows.
-    d. For raised text on a VERTICAL side of an imported mesh, use EXACTLY this verified
+    d. Only difference()/subtract from the imported base mesh when the user's request
+       calls for changing the base shape itself (cutting, engraving, hollowing, or a
+       creative reshape they describe). Pure additions must be union() only — never
+       accidental subtraction.
+    e. Thin/planar additions (sails, flags, fins, panels) must project into OPEN AIR —
+       verify against the cross-sections that their volume does not overlap an existing
+       solid, because union() makes anything inside another solid vanish. A sail on a
+       mast behind a cabin extends AWAY from the cabin, not through it.
+    f. For raised text on a VERTICAL side of an imported mesh, use EXACTLY this verified
        recipe (do not derive your own rotations — orientation algebra is error-prone):
        // readable from +Y; y_start just OUTSIDE the surface, depth crosses INTO the body
        module label_plus_y(txt, sz, x, z, y_start, depth)
@@ -102,12 +110,14 @@ difference() {
 """
 
 
-def qa_prompt(request: str, scad: str) -> str:
+def qa_prompt(request: str, scad: str, notes: list[str] | None = None) -> str:
+    note_block = ("\n".join(notes) + "\n\n") if notes else ""
     return (
         "You are reviewing a 3D-printable OpenSCAD model. The attached images are "
-        "renders of the code below; when a base mesh was modified, the first two images "
-        "are CLOSE-UPS of the changed/added geometry — judge placement and shape from "
-        "those, and overall composition from the wider views.\n\n"
+        "renders of the code below; when a base mesh was modified, the leading images "
+        "are CLOSE-UPS, one pair per changed/added region — judge placement and shape "
+        "from those, and overall composition from the wider views.\n\n"
+        f"{note_block}"
         f"Original request: {request}\n\nOpenSCAD code:\n{scad}\n\n"
         "Step 1: list every element/change the request demands. Step 2: for EACH one, "
         "verify it is present in the renders, sensibly placed, and proportioned to the "
@@ -139,7 +149,9 @@ def user_prompt(request: str, current_scad: str | None, mesh_note: str | None = 
             "each one as its own module with its own customizer variables (size, "
             "position), sized proportionally to the base model. Stylized/blocky is fine "
             "at small scale — invisible or omitted is not. Position additions using the "
-            "base mesh cross-sections/bounding box so they sit ON surfaces, not in air."
+            "base mesh cross-sections/bounding box so they sit ON surfaces, not in air. "
+            "Also PRUNE: delete modules and variables that are no longer used after your "
+            "change — the file must stay coherent across many refinements."
         )
     else:
         parts.append(f"Create a 3D-printable model: {request}")

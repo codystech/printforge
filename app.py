@@ -163,17 +163,42 @@ def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
     return out_png if out_png.exists() else None
 
 
-def added_region(base_stl: Path, new_stl: Path):
-    """Bounding box of geometry present in new_stl but not base_stl (or None)."""
+def _cluster_bboxes(pts, cell=8.0, max_regions=3):
+    """Group points into spatial clusters via a voxel grid; biggest clusters first."""
+    import numpy as np
+    from scipy import ndimage
+    mn = pts.min(axis=0)
+    idx = np.floor((pts - mn) / cell).astype(int)
+    grid = np.zeros(idx.max(axis=0) + 3, dtype=bool)
+    grid[tuple((idx + 1).T)] = True
+    lab, n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
+    labels = lab[tuple((idx + 1).T)]
+    out = []
+    for i in range(1, n + 1):
+        p = pts[labels == i]
+        if len(p) >= 8:
+            out.append((len(p), p.min(axis=0), p.max(axis=0)))
+    out.sort(key=lambda t: -t[0])
+    return [(a, b) for _, a, b in out[:max_regions]]
+
+
+def mesh_changes(base_stl: Path, new_stl: Path):
+    """Added-geometry cluster bboxes and removed-material info vs the base mesh."""
     import numpy as np
     base = trimesh.load_mesh(base_stl)
     new = trimesh.load_mesh(new_stl)
-    bc = set(map(tuple, np.round(base.triangles_center, 1)))
-    mask = np.array([tuple(c) not in bc for c in np.round(new.triangles_center, 1)])
-    if mask.sum() < 8:
-        return None
-    pts = new.triangles_center[mask]
-    return pts.min(axis=0), pts.max(axis=0)
+    bc = np.round(base.triangles_center, 1)
+    nc = np.round(new.triangles_center, 1)
+    bset, nset = set(map(tuple, bc)), set(map(tuple, nc))
+    added = new.triangles_center[[tuple(c) not in bset for c in nc]]
+    removed = base.triangles_center[[tuple(c) not in nset for c in bc]]
+    added_regions = _cluster_bboxes(added) if len(added) else []
+    removed_info = None
+    if len(removed) > 0.02 * len(bc):  # >2% of base surface gone = suspicious
+        clusters = _cluster_bboxes(removed, max_regions=1)
+        if clusters:
+            removed_info = {"fraction": len(removed) / len(bc), "bbox": clusters[0]}
+    return added_regions, removed_info
 
 
 async def vision_qa(prompt: str, scad: str, stl: Path,
@@ -182,22 +207,44 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     # oblique perspective views: straight-on orthographic hides low relief entirely
     scad_path = WORK_DIR / f"{stl.stem}.scad"
     views = []
-    # close-ups of whatever geometry differs from the base mesh — whole-model renders
-    # make a 10mm addition a smudge the reviewer cannot judge
+    qa_notes = []
+    # per-cluster close-ups of geometry that differs from the base mesh — whole-model
+    # renders make a 10mm addition a smudge the reviewer cannot judge
     if base_stl and base_stl.exists():
         try:
-            region = await asyncio.to_thread(added_region, base_stl, stl)
+            regions, removed = await asyncio.to_thread(mesh_changes, base_stl, stl)
         except Exception:
-            region = None
-        if region:
-            mn, mx = region
+            regions, removed = [], None
+        region_descs = []
+        for i, (mn, mx) in enumerate(regions):
             c = [(a + b) / 2 for a, b in zip(mn, mx)]
             dist = max(8.0, 2.2 * max(b - a for a, b in zip(mn, mx)))
-            for az, tag in ((30, "close1"), (210, "close2")):
+            region_descs.append(
+                f"region {i + 1}: x {mn[0]:.0f}..{mx[0]:.0f}, y {mn[1]:.0f}..{mx[1]:.0f}, "
+                f"z {mn[2]:.0f}..{mx[2]:.0f}")
+            for az, tag in ((30, f"r{i}a"), (210, f"r{i}b")):
                 views.append(render_png(
                     scad_path, WORK_DIR / f"{stl.stem}_{tag}.png",
                     camera=f"{c[0]:.1f},{c[1]:.1f},{c[2]:.1f},65,0,{az},{dist:.0f}",
                     ortho=False, imgsize="1000,750", fit=False))
+        if region_descs:
+            qa_notes.append(
+                "Visible NEW geometry was detected only in these regions (union erases "
+                "anything placed inside an existing solid): " + "; ".join(region_descs) +
+                ". Match every requested element to one of these regions — a requested "
+                "element with no region of its own is buried inside other geometry or "
+                "missing entirely; return a corrected file that moves it into open space."
+            )
+        if removed:
+            mn, mx = removed["bbox"]
+            qa_notes.append(
+                f"NOTE: {removed['fraction']:.0%} of the BASE mesh surface was removed, "
+                f"concentrated around x {mn[0]:.0f}..{mx[0]:.0f}, y {mn[1]:.0f}..{mx[1]:.0f}, "
+                f"z {mn[2]:.0f}..{mx[2]:.0f}. Decide from the request whether the user wanted "
+                "the base changed there (cuts/engraving/creative reshaping are legitimate "
+                "when asked for). If they did not, that is damage — return a corrected file "
+                "that preserves the base."
+            )
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_iso.png"))
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_top.png", camera="0,0,0,0,0,0,340"))
     views.append(render_png(scad_path, WORK_DIR / f"{stl.stem}_ob1.png",
@@ -208,7 +255,7 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     if not images:
         return scad, stl, "skipped"
     reply = await asyncio.to_thread(
-        call_codex, [{"role": "user", "content": qa_prompt(prompt, scad)}], images
+        call_codex, [{"role": "user", "content": qa_prompt(prompt, scad, qa_notes)}], images
     )
     if reply.strip() == "OK":
         return scad, stl, "passed"
