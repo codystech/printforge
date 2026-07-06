@@ -349,6 +349,60 @@ def load_rules(parent_id: str | None) -> list[str]:
     return _parent_meta(parent_id).get("rules", [])
 
 
+def load_part_state(parent_id: str | None) -> dict:
+    """Per-part lock/suppress/alias settings inherited from the parent model."""
+    return _parent_meta(parent_id).get("part_state", {})
+
+
+def part_state_block(ps: dict) -> str:
+    locked = [p for p, s in ps.items() if s.get("locked")]
+    suppressed = [p for p, s in ps.items() if s.get("suppressed")]
+    out = ""
+    if locked:
+        out += ("\nLOCKED PARTS: " + ", ".join(locked) + " — their modules, parameters "
+                "and placement are FROZEN. Do not modify, move, resize or restyle them "
+                "in any way; their code must remain byte-identical.\n")
+    if suppressed:
+        out += ("\nSUPPRESSED PARTS: " + ", ".join(suppressed) + " — the user removed "
+                "these. Keep their *_enabled defaults at 0, never re-enable them, and "
+                "do not recreate equivalent geometry under a new name.\n")
+    return out
+
+
+def module_block(scad: str, name: str) -> str | None:
+    """Extract the full text of `module <name>...{...}` by brace counting."""
+    m = re.search(rf"module\s+{re.escape(name)}\s*\(", scad)
+    if not m:
+        return None
+    i = scad.find("{", m.start())
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(scad)):
+        if scad[j] == "{":
+            depth += 1
+        elif scad[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return scad[m.start():j + 1]
+    return None
+
+
+def lock_violations(old_scad: str, new_scad: str, ps: dict) -> list[str]:
+    out = []
+    for part, s in ps.items():
+        if not s.get("locked"):
+            continue
+        for candidate in (part, f"{part}_module"):
+            before = module_block(old_scad, candidate)
+            if before is not None:
+                after = module_block(new_scad, candidate)
+                if after is None or " ".join(before.split()) != " ".join(after.split()):
+                    out.append(part)
+                break
+    return out
+
+
 def rules_block(rules: list[str]) -> str:
     if not rules:
         return ""
@@ -652,6 +706,7 @@ async def generate(req: GenerateRequest):
             if p:
                 images.append(str(p))
     mesh_note = _all_mesh_notes(_mesh_ids(req))
+    lock_issues: list[str] = []
     if req.current_scad and LLM_BACKEND == "codex":
         # refines edit the existing file in place — reprinting long files wholesale
         # reliably drops unrelated features
@@ -673,12 +728,25 @@ async def generate(req: GenerateRequest):
         instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
             rules_block(load_rules(req.parent_id)) +
+            part_state_block(load_part_state(req.parent_id)) +
             "The attached images (if any) are renders of the current model and/or a "
             f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
         )
         global LAST_BACKEND
         scad = await asyncio.to_thread(call_codex_edit, req.current_scad, instruction, images)
         LAST_BACKEND = "codex/gpt-5.5 (edit)"
+        # deterministic lock enforcement: diff the locked modules, force a fix if touched
+        ps = load_part_state(req.parent_id)
+        broken = lock_violations(req.current_scad, scad, ps)
+        if broken:
+            scad = await asyncio.to_thread(
+                call_codex_edit, scad,
+                "You modified LOCKED parts that must remain byte-identical: "
+                + ", ".join(broken) + ". Restore their module code exactly as in this "
+                "original version, and re-apply your change without touching them:\n\n"
+                + req.current_scad)
+            broken = lock_violations(req.current_scad, scad, ps)
+        lock_issues = broken
         try:
             stl = render_stl(scad, {})
         except HTTPException as e:
@@ -718,9 +786,11 @@ async def generate(req: GenerateRequest):
         fixes = 0
         for _ in range(QA_ROUNDS):
             try:
-                scad, stl, status = await vision_qa(req.prompt, scad, stl, base_stl,
-                                                    load_intent(req.parent_id),
-                                                    load_rules(req.parent_id))
+                ps_note = part_state_block(load_part_state(req.parent_id))
+                scad, stl, status = await vision_qa(
+                    req.prompt, scad, stl, base_stl,
+                    load_intent(req.parent_id) + ([ps_note] if ps_note else []),
+                    load_rules(req.parent_id))
             except Exception as e:
                 print(f"vision QA failed: {e}")
                 qa = f"fixed x{fixes}" if fixes else "skipped"
@@ -734,6 +804,11 @@ async def generate(req: GenerateRequest):
 
     model_id = save_to_library(req.prompt, scad, stl,
                                load_intent(req.parent_id) + [req.prompt], req.parent_id)
+    if load_part_state(req.parent_id):
+        meta_file = LIB_DIR / model_id / "meta.json"
+        meta = json.loads(meta_file.read_text())
+        meta["part_state"] = load_part_state(req.parent_id)
+        meta_file.write_text(json.dumps(meta))
     asyncio.create_task(_autoname(model_id, req.prompt))
     try:
         warnings = len(await asyncio.to_thread(floating_starts, stl))
@@ -741,7 +816,9 @@ async def generate(req: GenerateRequest):
         warnings = 0
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,
             "qa": qa, "model_id": model_id, "print_warnings": warnings,
-            "backend": LAST_BACKEND, "rules": load_rules(req.parent_id)}
+            "backend": LAST_BACKEND, "rules": load_rules(req.parent_id),
+            "part_state": load_part_state(req.parent_id),
+            "lock_violations": lock_issues}
 
 
 @app.post("/render")
@@ -951,6 +1028,25 @@ async def set_rules(model_id: str, req: RulesRequest):
     mdir = _model_dir(model_id)
     meta = json.loads((mdir / "meta.json").read_text())
     meta["rules"] = [r.strip() for r in req.rules if r.strip()][:20]
+    (mdir / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
+class PartStateRequest(BaseModel):
+    part_state: dict[str, dict]
+
+
+@app.put("/models/{model_id}/parts")
+async def set_part_state(model_id: str, req: PartStateRequest):
+    mdir = _model_dir(model_id)
+    meta = json.loads((mdir / "meta.json").read_text())
+    clean = {}
+    for part, s in list(req.part_state.items())[:30]:
+        if re.fullmatch(r"\w+", part):
+            clean[part] = {"locked": bool(s.get("locked")),
+                           "suppressed": bool(s.get("suppressed")),
+                           "alias": str(s.get("alias", ""))[:40]}
+    meta["part_state"] = clean
     (mdir / "meta.json").write_text(json.dumps(meta))
     return meta
 

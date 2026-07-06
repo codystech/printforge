@@ -173,6 +173,14 @@ async function showStl(id, fit) {
 // --- app state ---
 const $ = id => document.getElementById(id);
 let scad = null, stlId = null, refImage = null, meshIds = [], currentModelId = null;
+let partState = {}, lastParams = [];
+let psTimer = null;
+function savePartState() {
+  clearTimeout(psTimer);
+  psTimer = setTimeout(() => {
+    if (currentModelId) api(`/models/${currentModelId}/parts`, { part_state: partState }, 'PUT').catch(() => {});
+  }, 500);
+}
 
 let tick = null;
 function setStatus(msg, cls = '') {
@@ -189,6 +197,7 @@ function setBusyStatus(msg) {
 }
 
 function buildParams(params) {
+  lastParams = params;
   const box = $('params');
   box.innerHTML = '';
   // assembly controls: *_enabled toggles become the Parts panel
@@ -200,14 +209,47 @@ function buildParams(params) {
   $('asmtoggle').parentElement.style.display = asm ? 'inline' : 'none';
   if (asm) { $('asmtoggle').checked = asm.value >= 0.5; }
   for (const p of toggles) {
-    const l = document.createElement('label');
+    const part = p.name.replace('_enabled', '');
+    const st = partState[part] ?? (partState[part] = { locked: false, suppressed: false, alias: '' });
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:5px';
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = p.value >= 0.5;
+    cb.checked = st.suppressed ? false : p.value >= 0.5;
+    cb.disabled = st.suppressed;
     cb.dataset.name = p.name;
+    cb.title = 'show/hide (view only)';
     cb.onchange = () => rerender();
-    l.append(cb, ' ' + p.name.replace('_enabled', '').replaceAll('_', ' '));
-    partsDiv.appendChild(l);
+    const name = document.createElement('span');
+    name.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' + (st.suppressed ? ';text-decoration:line-through;opacity:.5' : '');
+    name.textContent = st.alias || part.replaceAll('_', ' ');
+    const mk = (txt, title, active, fn) => {
+      const b = document.createElement('button');
+      b.textContent = txt;
+      b.title = title;
+      b.style.cssText = `padding:0 4px;font-size:12px;background:none;opacity:${active ? 1 : .35}`;
+      b.onclick = fn;
+      return b;
+    };
+    const lock = mk('🔒', 'lock: the AI may not modify this part in refines', st.locked,
+      () => { st.locked = !st.locked; savePartState(); buildParams(lastParams); });
+    const sup = mk('🚫', 'suppress: remove from the model and forbid the AI from bringing it back', st.suppressed,
+      () => { st.suppressed = !st.suppressed; savePartState(); buildParams(lastParams); rerender(); });
+    const regen = mk('♻', 'regenerate only this part', true, () => {
+      $('prompt').value = `regenerate the ${st.alias || part} part from scratch to better fit the design; keep every other part completely unchanged`;
+      generate(false);
+    });
+    const ren = mk('✎', 'rename (display only)', true, () => {
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.value = st.alias || part; inp.style.cssText = 'flex:1;font-size:12px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48';
+      name.replaceWith(inp); inp.focus();
+      inp.onkeydown = ev => {
+        if (ev.key === 'Enter') { st.alias = inp.value.trim(); savePartState(); buildParams(lastParams); }
+        if (ev.key === 'Escape') buildParams(lastParams);
+      };
+    });
+    row.append(cb, name, lock, sup, regen, ren);
+    partsDiv.appendChild(row);
   }
   $('valreport').textContent = '';
   for (const p of params) {
@@ -240,8 +282,10 @@ function currentParams() {
   const out = {};
   for (const input of $('params').querySelectorAll('input'))
     out[input.dataset.name] = input.type === 'range' ? parseFloat(input.value) : input.value;
-  for (const cb of $('parts').querySelectorAll('input'))
+  for (const cb of $('parts').querySelectorAll('input[type=checkbox]'))
     out[cb.dataset.name] = cb.checked ? 1 : 0;
+  for (const [part, st] of Object.entries(partState))
+    if (st.suppressed) out[`${part}_enabled`] = 0;
   if ($('asmtoggle').parentElement.style.display !== 'none')
     out['assembled_preview'] = $('asmtoggle').checked ? 1 : 0;
   return out;
@@ -296,6 +340,8 @@ function showModel(r, statusMsg, cls = 'good') {
   currentModelId = r.model_id ?? r.meta?.id ?? currentModelId;
   $('rulesbox').style.display = currentModelId ? 'block' : 'none';
   $('rules').value = (r.meta?.rules ?? r.rules ?? []).join('\n');
+  partState = r.meta?.part_state ?? r.part_state ?? {};
+  if (r.lock_violations?.length) statusMsg += ` — ⚠ could not fully preserve locked: ${r.lock_violations.join(', ')}`;
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
