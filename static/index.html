@@ -310,6 +310,8 @@ $('validatebtn').onclick = async () => {
     $('valreport').textContent = r.issues.length
       ? r.issues.join('\n')
       : `✅ ${r.parts.length} parts, no collisions, clearances OK` + (r.assembled_check ? ' (checked assembled)' : ' (no assembled_preview — checked print layout)');
+    lastIssues = r.issues.filter(i => !/TOUCHING/.test(i));  // touching pairs are often intentional joints
+    $('fixbtn').hidden = !lastIssues.length;
     setStatus('');
   } catch (e) { setStatus(e.message, 'error'); }
   $('validatebtn').disabled = false;
