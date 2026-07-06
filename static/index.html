@@ -18,7 +18,7 @@
   #chips { display: flex; flex-wrap: wrap; gap: 6px; }
   #chips button { padding: 4px 9px; font-size: 12px; font-weight: 400; background: #2a2e36; color: #aab; border: 1px solid #3a3f48; }
   #chips button:hover { color: #e6e6e6; border-color: #e8734a; }
-  #imgrow { display: flex; gap: 8px; align-items: center; }
+  #imgrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #imgrow button { padding: 5px 10px; font-size: 12px; }
   #imgchip { display: none; align-items: center; gap: 6px; font-size: 12px; color: #aab; }
   #imgchip img { height: 34px; border-radius: 4px; }
@@ -527,6 +527,7 @@ function attachMesh(m) {
   chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px';
   const label = document.createElement('span');
   label.textContent = `📦 ${m.name}`;
+  label.style.cssText = 'max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
   const inclusion = r => (r === 'printable' || r === 'assembly') ? 'included in export: YES' : 'included in export: no (design reference)';
   const info = [m.format?.toUpperCase(), m.tris ? `${m.tris.toLocaleString()} tris` : null,
                 m.bodies > 1 ? `${m.bodies} bodies` : null,
