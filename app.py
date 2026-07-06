@@ -205,13 +205,14 @@ def print_report(stl_path: Path) -> dict:
 
 
 PRESETS_FILE = Path(__file__).parent / "presets.txt"
-DEFAULT_PRESETS = """phone width = 78 (with case)
-phone thickness = 12 (with case)
+DEFAULT_PRESETS = """# printing assumptions (edit to match your printer/results)
 nozzle = 0.4, layer height = 0.2
 slip fit clearance = 0.2, loose fit = 0.4
 minimum wall = 2.0
 raised text depth = 1.2, engraved text depth = 0.8
-desk edge thickness = 25"""
+# add measured objects you design around, e.g.:
+# phone width = 78 (with case), phone thickness = 12
+# desk edge thickness = 25"""
 
 
 def presets_block() -> str:
@@ -219,8 +220,9 @@ def presets_block() -> str:
     if not text:
         return ""
     return ("\nUSER DEFAULTS — measured values and printing assumptions for this user. "
-            "Apply them whenever relevant unless the request overrides them:\n"
-            + text + "\n")
+            "Use an entry ONLY when the request involves that object or setting; "
+            "entries irrelevant to the request must be completely ignored and never "
+            "mentioned. The request always overrides these:\n" + text + "\n")
 
 
 def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
