@@ -2,6 +2,8 @@
 # Run PrintForge on the host — required for the codex backend (codex CLI + auth
 # live on the host, not in the container). openscad comes from nix, python from uv.
 cd "$(dirname "$0")"
+# systemd services don't inherit the login shell PATH; codex lives in ~/.local/npm/bin
+export PATH="$HOME/.local/npm/bin:$HOME/.local/bin:$PATH"
 [ -f .env ] && . ./.env && export BAMBUDDY_API_KEY
 export LLM_BACKEND="${LLM_BACKEND:-codex}"
 # organic mode: CUDA + libGL for the sculpting venv (NixOS paths)

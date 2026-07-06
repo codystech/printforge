@@ -342,8 +342,13 @@ async function doRender() {
 
 async function api(path, body, method = 'POST') {
   const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-  if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
-  return r.json();
+  const text = await r.text();
+  if (!r.ok) {
+    let detail;
+    try { detail = JSON.parse(text).detail; } catch { detail = text; }
+    throw new Error(String(detail ?? r.statusText).slice(0, 400));
+  }
+  return text ? JSON.parse(text) : {};
 }
 
 function showModel(r, statusMsg, cls = 'good') {
