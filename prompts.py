@@ -159,6 +159,30 @@ ARCHETYPES = {
         "Standoffs/bosses: OD >= 2x screw diameter, pilot = screw dia - 0.4mm for "
         "thread-forming, height per request, 0.5mm base fillet, fused into the carrier "
         "floor by >=1mm embed.",
+    ("countersunk", "countersink", "flush screw"):
+        "Countersunk M3: 3.4mm through-hole + 82-degree cone opening to 6.5mm; screw "
+        "head finishes 0.2mm below the surface. M4: 4.5mm hole, cone to 8.5mm.",
+    ("magnet",):
+        "Magnet pockets: diameter = magnet + 0.2mm, depth = magnet height + 0.1mm; for "
+        "hidden magnets leave a 0.4-0.6mm cover skin and note the print orientation so "
+        "the pocket prints without supports (opening downward needs a bridge note).",
+    ("zip tie", "ziptie", "cable tie"):
+        "Zip-tie channels: 5.5 x 3mm rectangular tunnel with rounded entries, minimum "
+        "2mm wall around, route perpendicular to the mounting surface.",
+    ("keyhole", "wall hang"):
+        "Keyhole hangers: 8mm entry circle, 4.5mm wide x 12mm long slot, cavity 3.5mm "
+        "deep behind a 2.5mm-deep face slot (fits 8mm screw heads); orient slot upward.",
+    ("pegboard",):
+        "Pegboard (6mm/quarter-inch board): pegs 6.0mm dia, 25.4mm hole grid, hook pegs "
+        "bend 90 degrees with 8-10mm engagement behind the board, add a top-rear support "
+        "nub so hooks sit flush.",
+    ("dovetail",):
+        "Dovetails: 8-10 degree flank angle, 0.2mm sliding clearance, neck >=6mm, "
+        "stop shoulder at one end; orient the slide axis in the print plane.",
+    ("snap tab", "snap fit", "snap-fit", "latch", "clip on"):
+        "Snap tabs: arm length >= 8x arm thickness, 1.6-2.4mm thick, catch depth "
+        "0.8-1.2mm, 30-45 degree lead-in ramp, ~90 degree retention face; layers must "
+        "run along the arm (print the arm lying down).",
     ("cable gland", "pg7", "pg9", "strain relief"):
         "Cable glands: PG7 = 12.5mm hole, PG9 = 15.2mm hole, wall boss >=3mm thick "
         "around the hole; printable slit gasket alternative: cone with cable bore and "
@@ -181,7 +205,9 @@ def spec_prompt(request: str, mesh_note: str | None = None) -> str:
         "FEATURES: each feature with size and position\n"
         "PRINT: bed orientation, support needs, wall thicknesses\n"
         "PARTS: part/color layout if multi-part\n"
-        "ASSUMPTIONS: every guess the user should confirm or correct\n\n"
+        "ASSUMPTIONS: every guess the user should confirm or correct\n"
+        "MISSING: measurements you genuinely NEED from the user and could not infer "
+        "from the request or their presets (write exactly 'none' if fully covered)\n\n"
         + (f"{mesh_note}\n\n" if mesh_note else "")
         + f"Request: {request}"
     )

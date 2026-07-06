@@ -76,6 +76,7 @@
     <input id="meshfile" type="file" accept=".stl,.3mf,.obj,.svg,image/png,image/jpeg" hidden>
     <button id="linkbtn" class="secondary" type="button" title="import a model from a Printables/Thingiverse link">🔗</button>
     <button id="orgbtn" class="secondary" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)">🧬</button>
+    <button id="calbtn" class="secondary" type="button" title="tolerance test coupon: print it, test which peg fits which hole, record winners in My presets">🧪</button>
     <input id="orgfile" type="file" accept="image/*" hidden>
     <input id="orgsize" type="number" value="80" min="10" max="250" hidden style="width:52px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:4px" title="target size (mm)">
     <span id="meshchips" style="display:inline-flex;flex-wrap:wrap;gap:6px;font-size:12px;color:#aab"></span>
@@ -94,6 +95,8 @@
     <div id="valreport" style="font-size:12px;color:#ffb86b;white-space:pre-wrap"></div>
   </div>
   <div id="printinfo" style="display:none;font-size:12px;color:#8a93a3"></div>
+  <div id="diffinfo" style="display:none;font-size:12px;color:#8a93a3"></div>
+  <button id="fixbtn" class="secondary" hidden title="send the detected problems back as a repair refine">🩹 Fix detected issues</button>
   <details id="presetsbox"><summary style="font-size:12px;color:#aab">My presets (sizes the AI should assume)</summary>
     <textarea id="presets" style="height:110px;font-size:12px;margin-top:4px"></textarea>
   </details>
@@ -177,7 +180,7 @@ async function showStl(id, fit) {
 // --- app state ---
 const $ = id => document.getElementById(id);
 let scad = null, stlId = null, refImage = null, meshIds = [], currentModelId = null;
-let partState = {}, lastParams = [];
+let partState = {}, lastParams = [], lastIssues = [];
 let psTimer = null;
 function savePartState() {
   clearTimeout(psTimer);
@@ -346,6 +349,26 @@ function showModel(r, statusMsg, cls = 'good') {
   $('rules').value = (r.meta?.rules ?? r.rules ?? []).join('\n');
   partState = r.meta?.part_state ?? r.part_state ?? {};
   if (r.lock_violations?.length) statusMsg += ` — ⚠ could not fully preserve locked: ${r.lock_violations.join(', ')}`;
+  lastIssues = [...(r.print_warning_details ?? []),
+                ...(r.lock_violations ?? []).map(p => `locked part ${p} was altered — restore it`)];
+  $('fixbtn').hidden = !lastIssues.length;
+  $('diffinfo').style.display = 'none';
+  if (currentModelId) fetch(`/models/${currentModelId}/diff`).then(x => x.ok ? x.json() : null).then(d => {
+    if (!d) return;
+    const [ra, rb] = d.report;
+    const bits = [];
+    if (d.qa[0] !== d.qa[1]) bits.push(`QA ${d.qa[0] ?? '—'} → ${d.qa[1] ?? '—'}`);
+    if (ra?.est_grams_pla && rb?.est_grams_pla && ra.est_grams_pla !== rb.est_grams_pla)
+      bits.push(`${(rb.est_grams_pla - ra.est_grams_pla) > 0 ? '+' : ''}${(rb.est_grams_pla - ra.est_grams_pla).toFixed(1)}g`);
+    if (ra?.parts !== rb?.parts && rb?.parts) bits.push(`parts ${ra?.parts ?? '?'} → ${rb.parts}`);
+    if (d.params_changed.length) bits.push(`changed: ${d.params_changed.slice(0, 4).join(', ')}${d.params_changed.length > 4 ? '…' : ''}`);
+    if (d.params_added.length) bits.push(`new params: ${d.params_added.length}`);
+    if (d.params_removed.length) bits.push(`removed params: ${d.params_removed.length}`);
+    if (bits.length) {
+      $('diffinfo').textContent = `Δ vs "${d.parent_name}": ` + bits.join(' · ');
+      $('diffinfo').style.display = 'block';
+    }
+  }).catch(() => {});
   const rep = r.report ?? r.meta?.report;
   $('printinfo').style.display = rep?.bbox_mm ? 'block' : 'none';
   if (rep?.bbox_mm) $('printinfo').textContent =
@@ -382,6 +405,18 @@ async function generate(fresh) {
 }
 $('go').onclick = () => generate(!scad);
 $('new').onclick = () => generate(true);
+$('fixbtn').onclick = () => {
+  if (!lastIssues.length) return;
+  $('prompt').value = 'repair these printability problems with the smallest possible change, keeping the design otherwise identical:\n- ' + lastIssues.join('\n- ');
+  generate(false);
+};
+$('calbtn').onclick = async () => {
+  setBusyStatus('Building calibration coupon…');
+  try {
+    const r = await api('/calibration', null, 'GET');
+    await showModel(r, 'coupon ready — print it, test the fits, record winners in My presets');
+  } catch (e) { setStatus(e.message, 'error'); }
+};
 $('helpbtn').onclick = () => {
   const h = $('helpbox');
   h.style.display = h.style.display === 'none' ? 'block' : 'none';
@@ -403,7 +438,10 @@ $('specbtn').onclick = async () => {
     $('specbox').value = r.spec;
     $('specbox').style.display = 'block';
     $('specgen').style.display = 'block';
-    setStatus('review the spec — fix any wrong assumptions, then Generate from spec', 'good');
+    if (/MISSING:\s*(?!none\b)\S/i.test(r.spec))
+      setStatus('⚠ the spec is MISSING measurements it needs — fill them in (and add them to My presets) before generating', 'error');
+    else
+      setStatus('review the spec — fix any wrong assumptions, then Generate from spec', 'good');
   } catch (e) { setStatus(e.message, 'error'); }
   $('specbtn').disabled = false;
 };

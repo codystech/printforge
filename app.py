@@ -697,6 +697,63 @@ async def spec(req: SpecRequest):
     return {"spec": text}
 
 
+CALIBRATION_SCAD = """// PrintForge tolerance calibration coupon
+// Print flat, no supports. Test each peg in each hole; the clearance that slides
+// in snugly without force is YOUR slip-fit number - record it in My presets.
+hole_d = 5.0; // [4:0.5:8]
+peg_h = 8; // [6:1:12]
+$fn = 48;
+clearances = [0.1, 0.15, 0.2, 0.3, 0.4];
+// --- model ---
+plate_w = 16 * len(clearances) + 8;
+difference() {
+    cube([plate_w, 26, 4]);
+    for (i = [0:len(clearances)-1])
+        translate([12 + i*16, 16, -0.1]) cylinder(d=hole_d, h=4.2);
+}
+for (i = [0:len(clearances)-1]) {
+    translate([12 + i*16, 6, 4]) linear_extrude(0.6)
+        text(str(clearances[i]), size=3.5, halign="center", valign="center");
+    // pegs on their own bases, in front of the plate
+    translate([12 + i*16, -12, 0]) {
+        cylinder(d=10, h=2);
+        cylinder(d=hole_d - clearances[i], h=peg_h);
+        translate([0, -8, 0]) linear_extrude(0.6)
+            text(str(clearances[i]), size=3.5, halign="center", valign="center");
+    }
+}
+"""
+
+
+@app.get("/calibration")
+async def calibration():
+    stl = await asyncio.to_thread(render_stl, CALIBRATION_SCAD, {})
+    return {"scad": CALIBRATION_SCAD, "params": parse_params(CALIBRATION_SCAD),
+            "stl_id": stl.stem}
+
+
+@app.get("/models/{model_id}/diff")
+async def model_diff(model_id: str):
+    mdir = _model_dir(model_id)
+    meta = json.loads((mdir / "meta.json").read_text())
+    parent = meta.get("parent")
+    if not parent or not (LIB_DIR / parent / "meta.json").exists():
+        raise HTTPException(404, "no parent version")
+    pmeta = json.loads((LIB_DIR / parent / "meta.json").read_text())
+
+    def defaults(mid):
+        return {p["name"]: p["value"]
+                for p in parse_params((LIB_DIR / mid / "model.scad").read_text())}
+
+    a, b = defaults(parent), defaults(model_id)
+    return {"parent_name": pmeta.get("name", "previous"),
+            "qa": [pmeta.get("qa"), meta.get("qa")],
+            "report": [pmeta.get("report") or {}, meta.get("report") or {}],
+            "params_changed": [f"{k}: {a[k]} → {b[k]}" for k in a if k in b and a[k] != b[k]][:12],
+            "params_added": [k for k in b if k not in a][:12],
+            "params_removed": [k for k in a if k not in b][:12]}
+
+
 @app.get("/presets")
 async def get_presets():
     return {"text": PRESETS_FILE.read_text() if PRESETS_FILE.exists() else DEFAULT_PRESETS}
@@ -863,14 +920,18 @@ async def generate(req: GenerateRequest):
     meta_file.write_text(json.dumps(meta))
     asyncio.create_task(_autoname(model_id, req.prompt))
     try:
-        warnings = len(await asyncio.to_thread(floating_starts, stl))
+        floats_list = await asyncio.to_thread(floating_starts, stl)
     except Exception:
-        warnings = 0
+        floats_list = []
+    warnings = len(floats_list)
+    warning_details = [f"a feature starts in mid-air at z={f['z']}mm near x={f['x']}, y={f['y']}"
+                       for f in floats_list[:6]]
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,
             "qa": qa, "model_id": model_id, "print_warnings": warnings,
             "backend": LAST_BACKEND, "rules": load_rules(req.parent_id),
             "part_state": load_part_state(req.parent_id),
-            "lock_violations": lock_issues, "report": report}
+            "lock_violations": lock_issues, "report": report,
+            "print_warning_details": warning_details}
 
 
 @app.post("/render")
