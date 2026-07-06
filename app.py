@@ -636,6 +636,10 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
     except Exception as e:
         src.unlink(missing_ok=True)
         raise HTTPException(422, f"could not read {ext} file: {e}")
+    if m.is_empty or m.bounds is None or len(m.faces) == 0:
+        src.unlink(missing_ok=True)
+        raise HTTPException(422, f"'{filename}' contains no 3D geometry after conversion "
+                                 "— is it an empty or 2D-only file?")
     stl_path = UPLOADS_DIR / f"{mesh_id}.stl"
     m.export(stl_path)
     # keep the original only for STEP: it's true CAD source worth preserving

@@ -590,8 +590,13 @@ async function uploadMeshFile(f) {
   const fd = new FormData();
   fd.append('file', f);
   const r = await fetch('/upload-mesh' + (isBitmap ? '?trace=1' : ''), { method: 'POST', body: fd });
-  if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
-  attachMesh(await r.json());
+  const text = await r.text();
+  if (!r.ok) {
+    let detail;
+    try { detail = JSON.parse(text).detail; } catch { detail = text; }
+    throw new Error(String(detail ?? r.statusText).slice(0, 300));
+  }
+  attachMesh(JSON.parse(text));
 }
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
