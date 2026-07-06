@@ -86,6 +86,16 @@
   <button id="specgen" style="display:none">Generate from spec</button>
   <button id="new" class="secondary" hidden>New model (start fresh)</button>
   <div id="status"></div>
+  <div id="partsbox" style="display:none">
+    <b style="font-size:12px;color:#aab">Parts</b>
+    <label style="float:right;font-size:12px;color:#aab"><input type="checkbox" id="asmtoggle"> assembled view</label>
+    <div id="parts" style="display:flex;flex-direction:column;gap:4px;font-size:13px;margin-top:4px"></div>
+    <button id="validatebtn" class="secondary" style="margin-top:6px;width:100%" title="render each part in assembled position and check collisions and clearances">🔧 Validate assembly</button>
+    <div id="valreport" style="font-size:12px;color:#ffb86b;white-space:pre-wrap"></div>
+  </div>
+  <details id="rulesbox" style="display:none"><summary>Project rules (design law for every refine)</summary>
+    <textarea id="rules" style="height:90px;font-size:12px;margin-top:4px" placeholder="one rule per line, e.g.&#10;minimum wall thickness 2.4mm&#10;the Pi must stay centered&#10;printable without supports"></textarea>
+  </details>
   <div id="params"></div>
   <div class="btnrow">
     <button id="download" class="secondary" hidden title="single-file STL">STL</button>
@@ -181,7 +191,27 @@ function setBusyStatus(msg) {
 function buildParams(params) {
   const box = $('params');
   box.innerHTML = '';
+  // assembly controls: *_enabled toggles become the Parts panel
+  const partsDiv = $('parts');
+  partsDiv.innerHTML = '';
+  const toggles = params.filter(p => p.name.endsWith('_enabled'));
+  const asm = params.find(p => p.name === 'assembled_preview');
+  $('partsbox').style.display = toggles.length ? 'block' : 'none';
+  $('asmtoggle').parentElement.style.display = asm ? 'inline' : 'none';
+  if (asm) { $('asmtoggle').checked = asm.value >= 0.5; }
+  for (const p of toggles) {
+    const l = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = p.value >= 0.5;
+    cb.dataset.name = p.name;
+    cb.onchange = () => rerender();
+    l.append(cb, ' ' + p.name.replace('_enabled', '').replaceAll('_', ' '));
+    partsDiv.appendChild(l);
+  }
+  $('valreport').textContent = '';
   for (const p of params) {
+    if (p.name.endsWith('_enabled') || p.name === 'assembled_preview') continue;
     const div = document.createElement('div');
     div.className = 'param';
     const label = document.createElement('label');
@@ -210,8 +240,34 @@ function currentParams() {
   const out = {};
   for (const input of $('params').querySelectorAll('input'))
     out[input.dataset.name] = input.type === 'range' ? parseFloat(input.value) : input.value;
+  for (const cb of $('parts').querySelectorAll('input'))
+    out[cb.dataset.name] = cb.checked ? 1 : 0;
+  if ($('asmtoggle').parentElement.style.display !== 'none')
+    out['assembled_preview'] = $('asmtoggle').checked ? 1 : 0;
   return out;
 }
+$('asmtoggle').onchange = () => rerender();
+$('validatebtn').onclick = async () => {
+  $('validatebtn').disabled = true;
+  setBusyStatus('Validating assembly (rendering each part)…');
+  try {
+    const r = await api('/validate', { scad, params: currentParams() });
+    $('valreport').textContent = r.issues.length
+      ? r.issues.join('\n')
+      : `✅ ${r.parts.length} parts, no collisions, clearances OK` + (r.assembled_check ? ' (checked assembled)' : ' (no assembled_preview — checked print layout)');
+    setStatus('');
+  } catch (e) { setStatus(e.message, 'error'); }
+  $('validatebtn').disabled = false;
+};
+// project rules: saved per model, inherited by refines
+let rulesTimer = null;
+$('rules').oninput = () => {
+  clearTimeout(rulesTimer);
+  rulesTimer = setTimeout(async () => {
+    if (!currentModelId) return;
+    await api(`/models/${currentModelId}/rules`, { rules: $('rules').value.split('\n') }, 'PUT').catch(() => {});
+  }, 800);
+};
 
 let rerenderTimer = null, rendering = false, pending = false;
 function rerender() { clearTimeout(rerenderTimer); rerenderTimer = setTimeout(doRender, 400); }
@@ -238,6 +294,8 @@ async function api(path, body, method = 'POST') {
 function showModel(r, statusMsg, cls = 'good') {
   scad = r.scad; stlId = r.stl_id;
   currentModelId = r.model_id ?? r.meta?.id ?? currentModelId;
+  $('rulesbox').style.display = currentModelId ? 'block' : 'none';
+  $('rules').value = (r.meta?.rules ?? r.rules ?? []).join('\n');
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;

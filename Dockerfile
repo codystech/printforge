@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends openscad && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN pip install --no-cache-dir fastapi uvicorn httpx trimesh numpy scipy python-multipart networkx lxml shapely rtree
+RUN pip install --no-cache-dir fastapi uvicorn httpx trimesh numpy scipy python-multipart networkx lxml shapely rtree manifold3d
 COPY app.py prompts.py parts.py ./
 COPY static/ static/
 EXPOSE 8093

@@ -247,7 +247,8 @@ def mesh_changes(base_stl: Path, new_stl: Path):
 
 async def vision_qa(prompt: str, scad: str, stl: Path,
                     base_stl: Path | None = None,
-                    intent: list[str] | None = None) -> tuple[str, Path, str]:
+                    intent: list[str] | None = None,
+                    rules: list[str] | None = None) -> tuple[str, Path, str]:
     """One round of render-and-review; returns (scad, stl, qa_status)."""
     # oblique perspective views: straight-on orthographic hides low relief entirely
     scad_path = WORK_DIR / f"{stl.stem}.scad"
@@ -255,6 +256,8 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     qa_notes = []
     if intent:
         qa_notes.append(intent_block(intent))
+    if rules:
+        qa_notes.append(rules_block(rules))
     # per-cluster close-ups of geometry that differs from the base mesh — whole-model
     # renders make a 10mm addition a smudge the reviewer cannot judge
     if base_stl and base_stl.exists():
@@ -329,18 +332,35 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
     return edited, fixed_stl, "fixed"
 
 
+def _parent_meta(parent_id: str | None) -> dict:
+    if not parent_id or not re.fullmatch(r"[0-9a-f]{12}", parent_id):
+        return {}
+    meta_file = LIB_DIR / parent_id / "meta.json"
+    return json.loads(meta_file.read_text()) if meta_file.exists() else {}
+
+
 def load_intent(parent_id: str | None) -> list[str]:
     """Accepted design decisions inherited from the parent model's lineage."""
-    if not parent_id or not re.fullmatch(r"[0-9a-f]{12}", parent_id):
-        return []
-    meta_file = LIB_DIR / parent_id / "meta.json"
-    if not meta_file.exists():
-        return []
-    meta = json.loads(meta_file.read_text())
-    return meta.get("intent", [])
+    return _parent_meta(parent_id).get("intent", [])
 
 
-def save_to_library(prompt: str, scad: str, stl: Path, intent: list[str]) -> str:
+def load_rules(parent_id: str | None) -> list[str]:
+    """User-authored hard constraints inherited from the parent model."""
+    return _parent_meta(parent_id).get("rules", [])
+
+
+def rules_block(rules: list[str]) -> str:
+    if not rules:
+        return ""
+    lines = "\n- ".join(rules)
+    return (
+        "\nPROJECT RULES — hard constraints the user set for this project. These are "
+        f"design law, not suggestions; every edit must satisfy all of them:\n- {lines}\n"
+    )
+
+
+def save_to_library(prompt: str, scad: str, stl: Path, intent: list[str],
+                    parent_id: str | None = None) -> str:
     model_id = uuid.uuid4().hex[:12]
     mdir = LIB_DIR / model_id
     mdir.mkdir()
@@ -350,6 +370,8 @@ def save_to_library(prompt: str, scad: str, stl: Path, intent: list[str]) -> str
         "name": prompt.strip()[:60],
         "prompt": prompt,
         "intent": intent[-12:],
+        "rules": load_rules(parent_id),
+        "parent": parent_id,
         "created": time.time(),
     }))
     render_png(WORK_DIR / f"{stl.stem}.scad", mdir / "thumb.png", imgsize="400,300")
@@ -650,6 +672,7 @@ async def generate(req: GenerateRequest):
             pass
         instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
+            rules_block(load_rules(req.parent_id)) +
             "The attached images (if any) are renders of the current model and/or a "
             f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
         )
@@ -696,7 +719,8 @@ async def generate(req: GenerateRequest):
         for _ in range(QA_ROUNDS):
             try:
                 scad, stl, status = await vision_qa(req.prompt, scad, stl, base_stl,
-                                                    load_intent(req.parent_id))
+                                                    load_intent(req.parent_id),
+                                                    load_rules(req.parent_id))
             except Exception as e:
                 print(f"vision QA failed: {e}")
                 qa = f"fixed x{fixes}" if fixes else "skipped"
@@ -709,7 +733,7 @@ async def generate(req: GenerateRequest):
             qa = f"fixed x{fixes}"
 
     model_id = save_to_library(req.prompt, scad, stl,
-                               load_intent(req.parent_id) + [req.prompt])
+                               load_intent(req.parent_id) + [req.prompt], req.parent_id)
     asyncio.create_task(_autoname(model_id, req.prompt))
     try:
         warnings = len(await asyncio.to_thread(floating_starts, stl))
@@ -717,7 +741,7 @@ async def generate(req: GenerateRequest):
         warnings = 0
     return {"scad": scad, "params": parse_params(scad), "stl_id": stl.stem,
             "qa": qa, "model_id": model_id, "print_warnings": warnings,
-            "backend": LAST_BACKEND}
+            "backend": LAST_BACKEND, "rules": load_rules(req.parent_id)}
 
 
 @app.post("/render")
@@ -916,6 +940,70 @@ async def rename_model(model_id: str, req: RenameRequest):
     meta["name"] = req.name.strip()[:60]
     (mdir / "meta.json").write_text(json.dumps(meta))
     return meta
+
+
+class RulesRequest(BaseModel):
+    rules: list[str]
+
+
+@app.put("/models/{model_id}/rules")
+async def set_rules(model_id: str, req: RulesRequest):
+    mdir = _model_dir(model_id)
+    meta = json.loads((mdir / "meta.json").read_text())
+    meta["rules"] = [r.strip() for r in req.rules if r.strip()][:20]
+    (mdir / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
+class ValidateRequest(BaseModel):
+    scad: str
+    params: dict[str, float | str] = {}
+
+
+@app.post("/validate")
+async def validate(req: ValidateRequest):
+    """Render each *_enabled part in its assembled position; check collisions/clearance."""
+    from itertools import combinations
+    all_params = parse_params(req.scad)
+    toggles = [p["name"] for p in all_params if p["name"].endswith("_enabled")]
+    if not toggles:
+        raise HTTPException(400, "this model has no <part>_enabled toggles to validate "
+                                 "(older models predate assembly discipline — regenerate "
+                                 "or refine once to gain them)")
+    has_asm = any(p["name"] == "assembled_preview" for p in all_params)
+    meshes = {}
+    for name in toggles:
+        overrides = dict(req.params)
+        overrides.update({t: 0 for t in toggles})
+        overrides[name] = 1
+        if has_asm:
+            overrides["assembled_preview"] = 1
+        try:
+            stl = await asyncio.to_thread(render_stl, req.scad, overrides)
+            meshes[name.removesuffix("_enabled")] = trimesh.load_mesh(stl)
+        except HTTPException:
+            pass  # a part can legitimately render empty when others are disabled
+    issues = []
+    for (na, ma), (nb, mb) in combinations(meshes.items(), 2):
+        # bbox prefilter with 5mm margin
+        if any(ma.bounds[1][i] + 5 < mb.bounds[0][i] or mb.bounds[1][i] + 5 < ma.bounds[0][i]
+               for i in range(3)):
+            continue
+        try:
+            inter = trimesh.boolean.intersection([ma, mb], engine="manifold")
+            vol = float(inter.volume) if inter is not None and not inter.is_empty else 0.0
+        except Exception:
+            vol = 0.0
+        if vol > 0.5:
+            issues.append(f"COLLISION: {na} and {nb} overlap by ~{vol:.0f}mm³")
+        else:
+            pts, dist, _ = trimesh.proximity.closest_point(mb, ma.sample(200))
+            gap = float(dist.min())
+            if gap < 0.15:
+                issues.append(f"TOUCHING: {na} and {nb} (gap {gap:.2f}mm) — intentional joint or fused mistake?")
+            elif gap < 0.4:
+                issues.append(f"TIGHT FIT: {na} vs {nb} gap {gap:.2f}mm — below 0.4mm prints fused")
+    return {"parts": list(meshes), "assembled_check": has_asm, "issues": issues}
 
 
 @app.delete("/models/{model_id}")

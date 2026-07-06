@@ -28,7 +28,16 @@ Rules — follow ALL of them:
     printed in the assembled position, no support-needing overhangs inside the joint.
 12. A reference image may be attached: reproduce the pictured object's shape and
     proportions as printable geometry, inferring reasonable millimeter dimensions.
-13. When a BASE MESH file is provided, build on it with import("<given path>") — never
+13. ASSEMBLY DISCIPLINE for any multi-part design:
+    a. Every distinct part is its own module with a toggle parameter
+       `<part>_enabled = 1; // [0:1]`, and the top-level union calls it inside
+       `if (<part>_enabled > 0.5)`.
+    b. Provide `assembled_preview = 0; // [0:1]`. When 0, parts lie side by side in
+       print orientation (the default). When 1, every part renders in its ASSEMBLED
+       position (lid on the box, board on its standoffs). Implement per-part placement
+       as a translate/rotate chosen by this flag — assembled positions must be real so
+       fit can be checked.
+14. When a BASE MESH file is provided, build on it with import("<given path>") — never
     re-model the base shape from primitives. The prompt states its exact bounding box;
     position added features using those coordinates. Keep customizer variables for what
     you add (text, size, depth, position offsets). Rotate/translate the import only if
@@ -132,6 +141,28 @@ ARCHETYPES = {
     ("box", "enclosure", "case", "container"):
         "Boxes/enclosures: walls >=2mm, lid lip 1.5-2mm with 0.2mm clearance, inside "
         "corners filleted, screw posts 2x screw diameter with 0.2mm pilot clearance.",
+    # hardware library: verified real-world mounting dimensions
+    ("raspberry pi", "rpi", "pi 4", "pi 5", "pi4", "pi5"):
+        "Raspberry Pi B-series (3/4/5): board 85x56mm, 4x M2.5 holes on a 58x49mm grid, "
+        "3.5mm in from each corner. Standoffs: 6mm tall, 6mm OD, 2.2mm pilot for M2.5 "
+        "screws (or 2.7mm clearance if screwing into inserts). Leave 20mm above for "
+        "headers/HAT, ports overhang the 85mm edge by ~2mm.",
+    ("40mm fan", "fan 40", "4010", "cooling fan"):
+        "40mm fan: body 40x40x10mm, 4x mounting holes 32x32mm spacing, 4.3mm dia for "
+        "M3 screws or self-tappers, airflow opening 38mm dia; grill slots must total "
+        ">50% open area over the opening.",
+    ("heat insert", "heatset", "heat-set", "threaded insert"):
+        "Heat-set inserts: M3 = 4.0mm hole, 5.8mm deep, boss >=7mm OD; M2.5 = 3.4mm "
+        "hole, 5.0mm deep, boss >=6mm OD. Add 0.3mm entry chamfer; never closer than "
+        "2mm to a wall edge.",
+    ("standoff", "boss", "screw post"):
+        "Standoffs/bosses: OD >= 2x screw diameter, pilot = screw dia - 0.4mm for "
+        "thread-forming, height per request, 0.5mm base fillet, fused into the carrier "
+        "floor by >=1mm embed.",
+    ("cable gland", "pg7", "pg9", "strain relief"):
+        "Cable glands: PG7 = 12.5mm hole, PG9 = 15.2mm hole, wall boss >=3mm thick "
+        "around the hole; printable slit gasket alternative: cone with cable bore and "
+        "1mm slit.",
 }
 
 
