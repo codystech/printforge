@@ -192,6 +192,37 @@ def render_stl(scad: str, params: dict) -> Path:
     return stl_file
 
 
+def print_report(stl_path: Path) -> dict:
+    """Bounding box, weight estimate, connectivity — the numbers a maker checks first."""
+    m = trimesh.load_mesh(stl_path)
+    vol_cm3 = float(abs(m.volume)) / 1000.0 if m.is_volume else None
+    return {
+        "bbox_mm": [round(float(v), 1) for v in m.extents],
+        "watertight": bool(m.is_watertight),
+        "parts": len(m.split(only_watertight=False)),
+        "est_grams_pla": round(vol_cm3 * 1.24, 1) if vol_cm3 else None,
+    }
+
+
+PRESETS_FILE = Path(__file__).parent / "presets.txt"
+DEFAULT_PRESETS = """phone width = 78 (with case)
+phone thickness = 12 (with case)
+nozzle = 0.4, layer height = 0.2
+slip fit clearance = 0.2, loose fit = 0.4
+minimum wall = 2.0
+raised text depth = 1.2, engraved text depth = 0.8
+desk edge thickness = 25"""
+
+
+def presets_block() -> str:
+    text = PRESETS_FILE.read_text().strip() if PRESETS_FILE.exists() else DEFAULT_PRESETS
+    if not text:
+        return ""
+    return ("\nUSER DEFAULTS — measured values and printing assumptions for this user. "
+            "Apply them whenever relevant unless the request overrides them:\n"
+            + text + "\n")
+
+
 def render_png(scad_path: Path, out_png: Path, camera: str | None = None,
                imgsize: str = "800,600", ortho: bool = True, fit: bool = True) -> Path | None:
     cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(out_png), "--imgsize", imgsize]
@@ -661,8 +692,24 @@ def _mesh_note(mesh_id: str) -> str:
 @app.post("/spec")
 async def spec(req: SpecRequest):
     mesh_note = _all_mesh_notes(_mesh_ids(req))
-    text = await call_llm([{"role": "user", "content": spec_prompt(req.prompt, mesh_note)}])
+    text = await call_llm([{"role": "user",
+                            "content": spec_prompt(req.prompt, mesh_note) + presets_block()}])
     return {"spec": text}
+
+
+@app.get("/presets")
+async def get_presets():
+    return {"text": PRESETS_FILE.read_text() if PRESETS_FILE.exists() else DEFAULT_PRESETS}
+
+
+class PresetsRequest(BaseModel):
+    text: str
+
+
+@app.put("/presets")
+async def set_presets(req: PresetsRequest):
+    PRESETS_FILE.write_text(req.text[:4000])
+    return {"ok": True}
 
 
 async def _autoname(model_id: str, prompt: str):
@@ -725,7 +772,7 @@ async def generate(req: GenerateRequest):
                 )
         except Exception:
             pass
-        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + presets_block() + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
             rules_block(load_rules(req.parent_id)) +
             part_state_block(load_part_state(req.parent_id)) +
@@ -757,7 +804,7 @@ async def generate(req: GenerateRequest):
     else:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)
-                                          + _taste_example(req.prompt)},
+                                          + presets_block() + _taste_example(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
         scad = await call_llm(messages, images)
@@ -804,11 +851,16 @@ async def generate(req: GenerateRequest):
 
     model_id = save_to_library(req.prompt, scad, stl,
                                load_intent(req.parent_id) + [req.prompt], req.parent_id)
+    try:
+        report = await asyncio.to_thread(print_report, stl)
+    except Exception:
+        report = {}
+    meta_file = LIB_DIR / model_id / "meta.json"
+    meta = json.loads(meta_file.read_text())
+    meta.update({"qa": qa, "backend": LAST_BACKEND, "report": report})
     if load_part_state(req.parent_id):
-        meta_file = LIB_DIR / model_id / "meta.json"
-        meta = json.loads(meta_file.read_text())
         meta["part_state"] = load_part_state(req.parent_id)
-        meta_file.write_text(json.dumps(meta))
+    meta_file.write_text(json.dumps(meta))
     asyncio.create_task(_autoname(model_id, req.prompt))
     try:
         warnings = len(await asyncio.to_thread(floating_starts, stl))
@@ -818,7 +870,7 @@ async def generate(req: GenerateRequest):
             "qa": qa, "model_id": model_id, "print_warnings": warnings,
             "backend": LAST_BACKEND, "rules": load_rules(req.parent_id),
             "part_state": load_part_state(req.parent_id),
-            "lock_violations": lock_issues}
+            "lock_violations": lock_issues, "report": report}
 
 
 @app.post("/render")

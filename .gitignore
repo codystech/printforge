@@ -4,3 +4,4 @@ organic/.venv/
 organic/models/
 __pycache__/
 .env
+presets.txt

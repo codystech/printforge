@@ -93,6 +93,10 @@
     <button id="validatebtn" class="secondary" style="margin-top:6px;width:100%" title="render each part in assembled position and check collisions and clearances">🔧 Validate assembly</button>
     <div id="valreport" style="font-size:12px;color:#ffb86b;white-space:pre-wrap"></div>
   </div>
+  <div id="printinfo" style="display:none;font-size:12px;color:#8a93a3"></div>
+  <details id="presetsbox"><summary style="font-size:12px;color:#aab">My presets (sizes the AI should assume)</summary>
+    <textarea id="presets" style="height:110px;font-size:12px;margin-top:4px"></textarea>
+  </details>
   <details id="rulesbox" style="display:none"><summary>Project rules (design law for every refine)</summary>
     <textarea id="rules" style="height:90px;font-size:12px;margin-top:4px" placeholder="one rule per line, e.g.&#10;minimum wall thickness 2.4mm&#10;the Pi must stay centered&#10;printable without supports"></textarea>
   </details>
@@ -342,6 +346,12 @@ function showModel(r, statusMsg, cls = 'good') {
   $('rules').value = (r.meta?.rules ?? r.rules ?? []).join('\n');
   partState = r.meta?.part_state ?? r.part_state ?? {};
   if (r.lock_violations?.length) statusMsg += ` — ⚠ could not fully preserve locked: ${r.lock_violations.join(', ')}`;
+  const rep = r.report ?? r.meta?.report;
+  $('printinfo').style.display = rep?.bbox_mm ? 'block' : 'none';
+  if (rep?.bbox_mm) $('printinfo').textContent =
+    `${rep.bbox_mm.join(' × ')} mm · ${rep.parts} part${rep.parts > 1 ? 's' : ''}` +
+    (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g PLA` : '') +
+    (rep.watertight ? ' · watertight ✓' : ' · ⚠ not watertight');
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
@@ -587,6 +597,12 @@ async function loadLibrary() {
 
 // --- init ---
 $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('go').click(); } });
+fetch('/presets').then(r => r.json()).then(p => { $('presets').value = p.text; }).catch(() => {});
+let presetsTimer = null;
+$('presets').oninput = () => {
+  clearTimeout(presetsTimer);
+  presetsTimer = setTimeout(() => api('/presets', { text: $('presets').value }, 'PUT').catch(() => {}), 800);
+};
 fetch('/config').then(r => r.json()).then(c => {
   window.bambuddyOn = c.bambuddy;
   if (c.organic) { $('orgbtn').hidden = false; $('orgsize').hidden = false; }
