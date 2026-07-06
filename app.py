@@ -911,7 +911,15 @@ async def generate(req: GenerateRequest):
     model_id = save_to_library(req.prompt, scad, stl,
                                load_intent(req.parent_id) + [req.prompt], req.parent_id)
     try:
-        report = await asyncio.to_thread(print_report, stl)
+        report_stl, measured = stl, "print layout"
+        if any(p["name"] == "assembled_preview" for p in parse_params(scad)):
+            try:
+                report_stl = await asyncio.to_thread(render_stl, scad, {"assembled_preview": 1})
+                measured = "assembled"
+            except HTTPException:
+                pass
+        report = await asyncio.to_thread(print_report, report_stl)
+        report["measured"] = measured
     except Exception:
         report = {}
     meta_file = LIB_DIR / model_id / "meta.json"

@@ -374,7 +374,8 @@ function showModel(r, statusMsg, cls = 'good') {
   if (rep?.bbox_mm) $('printinfo').textContent =
     `${rep.bbox_mm.join(' × ')} mm · ${rep.parts} part${rep.parts > 1 ? 's' : ''}` +
     (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g PLA` : '') +
-    (rep.watertight ? ' · watertight ✓' : ' · ⚠ not watertight');
+    (rep.watertight ? ' · watertight ✓' : ' · ⚠ not watertight') +
+    (rep.measured ? ` · measured ${rep.measured}` : '');
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;

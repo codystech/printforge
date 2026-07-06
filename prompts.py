@@ -13,6 +13,9 @@ Rules — follow ALL of them:
    character widths.
 6. Use modules for repeated geometry. Keep it simple and printable.
 7. If the user asks to modify existing code, return the COMPLETE updated file.
+7b. Parameters exist ONLY for geometry the user can adjust. NEVER emit reports,
+    warnings, assumptions, status text or any other prose as string parameters —
+    the app measures and reports on the model itself.
 8. Multi-part designs (box + lid, housing + gasket): model each part as its own module,
    then lay all parts out side by side on the XY plane with 10mm gaps, each in its
    printing orientation (lid face down, etc.). The user splits them in the slicer.
