@@ -511,26 +511,39 @@ def _trace_to_svg(raw: bytes, filename: str) -> bytes:
     return svg.read_bytes()
 
 
+MESH_EXTS = {".stl", ".3mf", ".obj", ".glb", ".gltf", ".step", ".stp"}
+
+
 def _register_mesh(raw: bytes, filename: str) -> dict:
     ext = Path(filename or "m.stl").suffix.lower()
     if ext == ".svg":
         return _register_svg(raw, filename)
-    if ext not in {".stl", ".3mf", ".obj"}:
-        raise HTTPException(415, "only .stl, .3mf, .obj meshes or .svg outlines")
+    if ext not in MESH_EXTS:
+        raise HTTPException(415, f"unsupported format '{ext}' — use STL, 3MF, OBJ, "
+                                 "GLB/GLTF, STEP/STP, or SVG outlines")
     if len(raw) > 100_000_000:
-        raise HTTPException(413, "mesh too large")
+        raise HTTPException(413, "mesh too large (100MB cap)")
+    if ext in {".step", ".stp"}:
+        try:
+            import cascadio  # noqa: F401 — feature detection for the CAD kernel
+        except ImportError:
+            raise HTTPException(415, "STEP import requires a CAD conversion backend — "
+                                     "add '--with cascadio' to run.sh deps and restart")
     mesh_id = uuid.uuid4().hex[:12]
-    tmp = UPLOADS_DIR / f"{mesh_id}{ext}"
-    tmp.write_bytes(raw)
+    src = UPLOADS_DIR / f"{mesh_id}{ext}"
+    src.write_bytes(raw)
     try:
-        m = trimesh.load(tmp, force="mesh")
+        m = trimesh.load(src, force="mesh")
+        if ext in {".step", ".stp"}:
+            m.apply_scale(1000)  # cascadio emits GLB meters; STEP dimensions are mm
     except Exception as e:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(422, f"could not read mesh: {e}")
+        src.unlink(missing_ok=True)
+        raise HTTPException(422, f"could not read {ext} file: {e}")
     stl_path = UPLOADS_DIR / f"{mesh_id}.stl"
     m.export(stl_path)
-    if tmp != stl_path:
-        tmp.unlink()
+    # keep the original only for STEP: it's true CAD source worth preserving
+    if src != stl_path and ext not in {".step", ".stp"}:
+        src.unlink()
     # horizontal cross-sections so the LLM knows where surfaces actually are per height
     sections = []
     z0, z1 = m.bounds[0][2], m.bounds[1][2]
@@ -545,9 +558,19 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
                                  "y": [round(b[0][1], 1), round(b[1][1], 1)]})
         except Exception:
             pass
-    meta = {"id": mesh_id, "name": filename,
+    maxdim = float(max(m.extents))
+    warning = None
+    if maxdim < 5:
+        warning = (f"model is only {maxdim:.1f}mm across — units may be inches; "
+                   "if so, ask a refine to scale it by 25.4")
+    elif maxdim > 400:
+        warning = f"model is {maxdim:.0f}mm across — bigger than the bed; check units/scale"
+    meta = {"id": mesh_id, "name": filename, "format": ext.lstrip("."),
+            "role": "printable",
             "bounds_min": [round(v, 1) for v in m.bounds[0]],
             "bounds_max": [round(v, 1) for v in m.bounds[1]],
+            "tris": int(len(m.faces)), "watertight": bool(m.is_watertight),
+            "warning": warning,
             "sections": sections}
     (UPLOADS_DIR / f"{mesh_id}.json").write_text(json.dumps(meta))
     return meta
@@ -678,16 +701,29 @@ def _mesh_note(mesh_id: str) -> str:
             "build any mounts/bosses relative to the extrusion."
         )
     path = (UPLOADS_DIR / f"{mesh_id}.stl").resolve()
+    role = meta.get("role", "printable")
+    role_note = {
+        "reference": "\nROLE = REFERENCE ONLY: derive fits, clearances, cutout positions "
+                     "and mounting geometry from this object, but its geometry must NOT "
+                     "appear in the printable output. It may be shown only under "
+                     "`if (assembled_preview > 0.5)` with its own *_enabled toggle "
+                     "defaulting to 0.",
+        "negative": "\nROLE = NEGATIVE SPACE: subtract this object's envelope plus the "
+                    "requested clearance from surrounding printed parts. Never include "
+                    "it as printed geometry.",
+    }.get(role, "")
+    info_note = (f"\n(format: {meta.get('format', 'stl')}, {meta.get('tris', '?')} "
+                 f"triangles, watertight: {meta.get('watertight')})")
     secs = "".join(
         f"\n  at z={s['z']}: x {s['x'][0]}..{s['x'][1]}, y {s['y'][0]}..{s['y'][1]}"
         for s in meta.get("sections", [])
     )
     return (
-        f'BASE MESH provided ("{meta["name"]}"): import("{path}");\n'
+        f'BASE MESH provided ("{meta["name"]}"): import("{path}");{info_note}\n'
         f"Bounding box: min {meta['bounds_min']} to max {meta['bounds_max']} mm (x,y,z).\n"
         f"Horizontal cross-section extents (the body only exists within these at each height):{secs}\n"
         "Place features ONLY where these sections show material at that height, and start "
-        "them inside the section extents so they fuse."
+        "them inside the section extents so they fuse." + role_note
     )
 
 
@@ -972,9 +1008,62 @@ def _build_3mf(stl_id: str) -> Path:
 
 
 @app.get("/export/{stl_id}")
-async def export_3mf(stl_id: str):
-    return FileResponse(_build_3mf(stl_id), media_type="model/3mf",
-                        filename="printforge-model.3mf")
+async def export_model(stl_id: str, fmt: str = "3mf"):
+    if fmt == "3mf":
+        return FileResponse(_build_3mf(stl_id), media_type="model/3mf",
+                            filename="printforge-model.3mf")
+    if fmt in {"obj", "glb"}:
+        out = WORK_DIR / f"{stl_id}.{fmt}"
+        trimesh.load_mesh(_stl_path(stl_id)).export(out)
+        return FileResponse(out, filename=f"printforge-model.{fmt}")
+    if fmt == "step":
+        raise HTTPException(400, "STEP export requires CAD/BRep output; this model is "
+                                 "mesh-only. Use STL, 3MF, OBJ or GLB.")
+    raise HTTPException(400, f"unknown export format '{fmt}' (3mf, obj, glb)")
+
+
+class MeshRoleRequest(BaseModel):
+    role: str
+
+
+@app.patch("/uploads/{mesh_id}")
+async def set_mesh_role(mesh_id: str, req: MeshRoleRequest):
+    if req.role not in {"printable", "reference", "negative"}:
+        raise HTTPException(400, "role must be printable, reference or negative")
+    if not re.fullmatch(r"[0-9a-f]{12}", mesh_id):
+        raise HTTPException(400, "bad id")
+    meta_file = UPLOADS_DIR / f"{mesh_id}.json"
+    if not meta_file.exists():
+        raise HTTPException(404, "mesh not found")
+    meta = json.loads(meta_file.read_text())
+    meta["role"] = req.role
+    meta_file.write_text(json.dumps(meta))
+    return meta
+
+
+@app.get("/models/{model_id}/zip")
+async def model_zip(model_id: str):
+    import zipfile
+    mdir = _model_dir(model_id)
+    out = WORK_DIR / f"{model_id}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in mdir.iterdir():
+            z.write(f, f.name)
+    return FileResponse(out, filename=f"printforge-{model_id}.zip")
+
+
+@app.post("/models/{model_id}/duplicate")
+async def model_duplicate(model_id: str):
+    mdir = _model_dir(model_id)
+    new_id = uuid.uuid4().hex[:12]
+    shutil.copytree(mdir, LIB_DIR / new_id)
+    meta_file = LIB_DIR / new_id / "meta.json"
+    meta = json.loads(meta_file.read_text())
+    meta["id"] = new_id
+    meta["name"] = (meta.get("name", "model") + " (copy)")[:60]
+    meta["created"] = time.time()
+    meta_file.write_text(json.dumps(meta))
+    return meta
 
 
 @app.post("/send/{stl_id}")
