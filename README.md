@@ -5,20 +5,48 @@ parametric OpenSCAD → vision self-check catches geometry bugs → tweak with
 sliders → download STL / split-part 3MF → slice in Bambu Studio, or send it
 straight to the Bambuddy archive.
 
-v2 features: vision QA (renders reviewed by gpt-5.5 before you see them),
-multi-part/multi-color 3MF export (one object per connected part, AMS-ready),
-model library with thumbnails (auto-saved, reload/rename/delete), photo/sketch
-input, preset chips, 256mm P1S build plate in the viewer.
+## Current features
 
-v3 features: SVG import + bitmap logo tracing (real curves via potrace →
-`linear_extrude(import(svg))`), ✍ Spec preview (your prompt becomes an
-editable design spec before generation), archetype guidance (gridfinity,
-hinges, clips, signs, enclosures), auto-named library entries, AMS color
-palette baked into 3MF parts, and 🧬 organic mode — Hunyuan3D-2 on the local
-3090 sculpts a mesh from a photo, which lands as a base model you can then
-personalize with the normal remix pipeline. Organic setup (one-time):
-`organic/setup.sh`. The GPU is shared with the local LLM brain: PrintForge
-unloads ollama models before sculpting; they reload lazily afterward.
+**Creating models**
+- Plain-English prompt → parametric OpenSCAD via codex/gpt-5.5 (falls back to
+  local qwen when rate-limited; the status line names which model answered)
+- ✍ Spec preview: your prompt becomes an editable design spec (dimensions,
+  features, print orientation, ASSUMPTIONS to correct) before generating
+- Archetype guidance auto-injected by keyword: gridfinity, print-in-place
+  hinges, clips, signs, enclosures + hardware specs (Raspberry Pi mounting
+  grid, 40mm fans, heat-set inserts, standoffs, cable glands)
+- 🧬 Organic mode: Hunyuan3D-2 on the local GPU sculpts a real mesh from a
+  photo (setup once via `organic/setup.sh`; auto-unloads the ollama brain)
+- 📦 Remix: attach STL/3MF/OBJ files, or bitmap logos (auto-traced to SVG
+  curves via potrace), or 🔗 import directly from Printables/Thingiverse URLs
+- Multi-mesh integration: attach up to 3 base meshes ("mount this Pi model
+  inside this case on standoffs") — each sent with measured dimensions
+
+**Quality machinery**
+- Vision QA loop: renders (incl. close-ups of changed regions diffed against
+  the previous state) reviewed by gpt-5.5, up to 2 auto-fix rounds
+- Printability detector: slices bottom-up and flags features that start in
+  mid-air (Bambu's "floating regions") with coordinates; fed back for fixes
+- Refines run through codex's file-editing tools (no full-file rewrites) and
+  inherit design intent — every accepted change is preserved as law
+- 👍/👎 taste training: liked models are retrieved as few-shot examples for
+  similar future prompts
+
+**Assembly (v1 + Parts Panel v2)**
+- Every part gets an `_enabled` toggle + `assembled_preview` mode
+- Parts panel: hide, 🔒 lock (hard constraint, verified by diffing the locked
+  module after each refine), 🚫 suppress (AI may not re-add), ✎ rename,
+  ♻ regenerate-one-part
+- Project rules: user-authored constraints stored per model, inherited by
+  refines, enforced in generation and QA
+- 🔧 Validate assembly: renders each part in assembled position, checks
+  pairwise collisions (manifold booleans) and clearances (<0.4mm warned)
+
+**Output & library**
+- STL download; multi-part 3MF with per-part AMS color palette; direct upload
+  to a Bambuddy archive
+- Library: auto-saved, auto-named (local LLM), thumbnails, ratings, rename,
+  delete, lineage (parent links), per-model rules and part states
 
 ## Run (primary — host, codex backend)
 
