@@ -808,13 +808,16 @@ def _mesh_note(mesh_id: str) -> str:
     role_note = {
         "reference": "\nROLE = REFERENCE ONLY: derive fits, clearances, cutout positions "
                      "and mounting geometry from this object, but its geometry must NOT "
-                     "appear in the printable output. It may be shown only under "
-                     "`if (assembled_preview > 0.5)` with its own *_enabled toggle "
-                     "defaulting to 0.",
+                     "appear in the printable output. Give it a preview module guarded "
+                     "ONLY by its own `<name>_preview_enabled = 0; // [0:1]` toggle — "
+                     "when the user enables it, render it at its ASSEMBLED position in "
+                     "both layouts (a floating preview over the print layout is fine).",
         "fit_cutout": "\nROLE = FIT/CUTOUT REFERENCE: measure this object to size every "
                       "cavity, port cutout, standoff position and clearance around it — "
-                      "but its geometry must NOT appear in the printable output (preview "
-                      "only under assembled_preview, toggle default 0).",
+                      "but its geometry must NOT appear in the printable output. Give it "
+                      "a preview module guarded ONLY by its own "
+                      "`<name>_preview_enabled = 0; // [0:1]` toggle, rendered at its "
+                      "assembled position in both layouts when enabled.",
         "assembly": "\nROLE = ASSEMBLY COMPONENT: include it as a printable part of the "
                     "assembly, positioned per the request, with its own *_enabled toggle.",
         "negative": "\nROLE = NEGATIVE SPACE: subtract this object's envelope plus the "

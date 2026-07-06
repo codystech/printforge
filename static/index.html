@@ -246,9 +246,11 @@ function buildParams(params) {
     cb.dataset.name = p.name;
     cb.title = 'show/hide (view only)';
     cb.onchange = () => rerender();
+    const isPreview = /(preview|reference|board)/i.test(part);
     const name = document.createElement('span');
     name.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' + (st.suppressed ? ';text-decoration:line-through;opacity:.5' : '');
-    name.textContent = st.alias || part.replaceAll('_', ' ');
+    name.textContent = (st.alias || part.replaceAll('_', ' ')) + (isPreview ? ' 👁' : '');
+    if (isPreview) name.title = 'preview only — automatically excluded from STL/3MF/Bambuddy exports';
     const mk = (txt, title, active, fn) => {
       const b = document.createElement('button');
       b.textContent = txt;
@@ -643,15 +645,30 @@ document.addEventListener('paste', e => {
 });
 
 // --- downloads / send ---
-$('download').onclick = () => { if (stlId) location.href = `/stl/${stlId}?download=1`; };
-$('download3mf').onclick = () => { if (stlId) location.href = `/export/${stlId}`; };
+async function exportStlId() {
+  // visibility ≠ export: previews/reference boards and assembled view are
+  // forced off for anything that leaves the app
+  const p = currentParams();
+  let changed = false;
+  for (const k of Object.keys(p)) {
+    if (/_enabled$/.test(k) && /(preview|reference|board)/i.test(k) && p[k]) { p[k] = 0; changed = true; }
+  }
+  if (p['assembled_preview']) { p['assembled_preview'] = 0; changed = true; }
+  if (!changed) return stlId;
+  setBusyStatus('Preparing export (print layout, previews excluded)…');
+  const r = await api('/render', { scad, params: p });
+  setStatus('');
+  return r.stl_id;
+}
+$('download').onclick = async () => { if (stlId) location.href = `/stl/${await exportStlId()}?download=1`; };
+$('download3mf').onclick = async () => { if (stlId) location.href = `/export/${await exportStlId()}`; };
 $('send').onclick = async () => {
   if (!stlId) return;
   $('send').disabled = true;
   setBusyStatus('Uploading to Bambuddy…');
   try {
     const name = encodeURIComponent(($('params').querySelector('input[type=text]')?.value ?? 'printforge-model'));
-    await api(`/send/${stlId}?name=${name}`, null);
+    await api(`/send/${await exportStlId()}?name=${name}`, null);
     setStatus('sent to Bambuddy ✓', 'good');
   } catch (e) { setStatus(e.message, 'error'); }
   $('send').disabled = false;
