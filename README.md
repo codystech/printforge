@@ -10,23 +10,45 @@ straight to the Bambuddy archive.
 **Creating models**
 - Plain-English prompt → parametric OpenSCAD via codex/gpt-5.5 (falls back to
   local qwen when rate-limited; the status line names which model answered)
-- ✍ Spec preview: your prompt becomes an editable design spec (dimensions,
-  features, print orientation, ASSUMPTIONS to correct) before generating
-- Archetype guidance auto-injected by keyword: gridfinity, print-in-place
-  hinges, clips, signs, enclosures + hardware specs (Raspberry Pi mounting
-  grid, 40mm fans, heat-set inserts, standoffs, cable glands)
+- ✍ Spec preview: your prompt becomes an editable design spec with PRINTER,
+  ATTACHED (per-model context), ASSUMPTIONS and MISSING sections — correct it
+  before any generation time is spent
+- 🖨 Printer profiles: neutral machine/material profiles (Bambu A1/P1S ×
+  PLA/PETG, Generic FDM) selected per browser; bed volume, nozzle, layer,
+  material, clearances, detail limits and AMS support become hard constraints
+  for every job. Prompts naming another printer override visibly per job;
+  refining under a different profile warns first. Custom profiles via
+  `PUT /profiles/custom`.
+- My presets: your measured objects (phone, desk edge, calibrated fits) fed
+  into every relevant spec/generation; 🧪 builds a tolerance calibration
+  coupon so those numbers come from your actual printer
+- Archetype + hardware guidance injected by keyword: gridfinity, hinges,
+  clips, signs, enclosures, Raspberry Pi mounting grid, 40mm fans, heat-set
+  inserts, standoffs, cable glands, countersinks, magnet pockets, zip-tie
+  channels, keyhole hangers, pegboard hooks, dovetails, snap tabs
 - 🧬 Organic mode: Hunyuan3D-2 on the local GPU sculpts a real mesh from a
   photo (setup once via `organic/setup.sh`; auto-unloads the ollama brain)
-- 📦 Remix: attach STL/3MF/OBJ files, or bitmap logos (auto-traced to SVG
-  curves via potrace), or 🔗 import directly from Printables/Thingiverse URLs
-- Multi-mesh integration: attach up to 3 base meshes ("mount this Pi model
-  inside this case on standoffs") — each sent with measured dimensions
+- 📦 Import: drag-and-drop STL / 3MF / OBJ / GLB / **STEP** (converted through
+  OpenCascade, original preserved) / bitmap logos (auto-traced to SVG curves),
+  or 🔗 import from Printables/Thingiverse URLs. Every upload is inspected:
+  format, dimensions, triangles, bodies, watertightness, unit warnings.
+- Mesh roles per upload: 🖨 printable / 👁 reference / 📐 fit-cutout /
+  🧩 assembly / ⛔ negative-space. Reference boards never enter printable
+  output, and a guard warns if you ask for a "case" around a printable mesh.
+- Multi-mesh integration: up to 3 base meshes ("mount this Pi model inside
+  this case on standoffs") — each sent with measured dimensions and its role
 
 **Quality machinery**
 - Vision QA loop: renders (incl. close-ups of changed regions diffed against
   the previous state) reviewed by gpt-5.5, up to 2 auto-fix rounds
 - Printability detector: slices bottom-up and flags features that start in
-  mid-air (Bambu's "floating regions") with coordinates; fed back for fixes
+  mid-air (Bambu's "floating regions") with coordinates; 🩹 one click sends
+  detected issues back as a minimal repair refine
+- Print report on every generation: assembled dimensions, part count,
+  material-correct weight estimate, watertightness, bed-fit check against the
+  active printer profile
+- Δ version compare: refines show QA transition, weight delta, part-count and
+  parameter changes vs the parent version
 - Refines run through codex's file-editing tools (no full-file rewrites) and
   inherit design intent — every accepted change is preserved as law
 - 👍/👎 taste training: liked models are retrieved as few-shot examples for
@@ -43,10 +65,13 @@ straight to the Bambuddy archive.
   pairwise collisions (manifold booleans) and clearances (<0.4mm warned)
 
 **Output & library**
-- STL download; multi-part 3MF with per-part AMS color palette; direct upload
-  to a Bambuddy archive
-- Library: auto-saved, auto-named (local LLM), thumbnails, ratings, rename,
-  delete, lineage (parent links), per-model rules and part states
+- Export: STL, multi-part 3MF with per-part AMS color palette, OBJ and GLB
+  (`/export/{id}?fmt=`); STEP export is honestly refused (mesh-only
+  pipeline); direct upload to a Bambuddy archive
+- Library: auto-saved, auto-named (local LLM), thumbnails, ratings, search
+  (incl. printer profile), rename, duplicate, delete, download-as-ZIP,
+  copy-prompt, lineage (parent links), per-model rules, part states, QA
+  outcome, backend and printer-profile snapshot in metadata
 
 ## Run (primary — host, codex backend)
 
@@ -93,6 +118,9 @@ phone stand into an LED sign.
 ## Later (deliberately not built yet)
 
 - Deploy to a lab CT behind NPM/Authelia once it proves useful.
-- Phase 2: organic/figurine generation (Hunyuan3D/TripoSR on the 3090).
-- SVG import for real logo silhouettes (code-CAD polygon art is angular).
-- STEP export, filament color metadata inside the 3MF.
+- Sparc3D/TRELLIS.2 evaluation as alternative organic backends.
+- Thumbs-down models as explicit negative examples.
+- Bambu-native paint-color metadata (basematerials support unconfirmed).
+- Text-only figurines (local image gen chained into Hunyuan3D).
+- In-UI custom printer-profile editor (API-only today).
+- Thin-wall analysis (the slicer does it better — intentionally skipped).
