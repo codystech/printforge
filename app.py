@@ -558,6 +558,10 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
                                  "y": [round(b[0][1], 1), round(b[1][1], 1)]})
         except Exception:
             pass
+    try:
+        bodies = len(m.split(only_watertight=False))
+    except Exception:
+        bodies = 1
     maxdim = float(max(m.extents))
     warning = None
     if maxdim < 5:
@@ -569,7 +573,8 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
             "role": "printable",
             "bounds_min": [round(v, 1) for v in m.bounds[0]],
             "bounds_max": [round(v, 1) for v in m.bounds[1]],
-            "tris": int(len(m.faces)), "watertight": bool(m.is_watertight),
+            "tris": int(len(m.faces)), "bodies": bodies,
+            "watertight": bool(m.is_watertight),
             "warning": warning,
             "sections": sections}
     (UPLOADS_DIR / f"{mesh_id}.json").write_text(json.dumps(meta))
@@ -708,6 +713,12 @@ def _mesh_note(mesh_id: str) -> str:
                      "appear in the printable output. It may be shown only under "
                      "`if (assembled_preview > 0.5)` with its own *_enabled toggle "
                      "defaulting to 0.",
+        "fit_cutout": "\nROLE = FIT/CUTOUT REFERENCE: measure this object to size every "
+                      "cavity, port cutout, standoff position and clearance around it — "
+                      "but its geometry must NOT appear in the printable output (preview "
+                      "only under assembled_preview, toggle default 0).",
+        "assembly": "\nROLE = ASSEMBLY COMPONENT: include it as a printable part of the "
+                    "assembly, positioned per the request, with its own *_enabled toggle.",
         "negative": "\nROLE = NEGATIVE SPACE: subtract this object's envelope plus the "
                     "requested clearance from surrounding printed parts. Never include "
                     "it as printed geometry.",
@@ -1028,8 +1039,9 @@ class MeshRoleRequest(BaseModel):
 
 @app.patch("/uploads/{mesh_id}")
 async def set_mesh_role(mesh_id: str, req: MeshRoleRequest):
-    if req.role not in {"printable", "reference", "negative"}:
-        raise HTTPException(400, "role must be printable, reference or negative")
+    if req.role not in {"printable", "reference", "fit_cutout", "assembly", "negative"}:
+        raise HTTPException(400, "role must be printable, reference, fit_cutout, "
+                                 "assembly or negative")
     if not re.fullmatch(r"[0-9a-f]{12}", mesh_id):
         raise HTTPException(400, "bad id")
     meta_file = UPLOADS_DIR / f"{mesh_id}.json"

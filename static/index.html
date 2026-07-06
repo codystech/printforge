@@ -387,9 +387,16 @@ function showModel(r, statusMsg, cls = 'good') {
   return showStl(stlId, true).then(() => setStatus(statusMsg, cls));
 }
 
+let guardAcknowledged = false;
 async function generate(fresh) {
   const prompt = $('prompt').value.trim();
   if (!prompt) return;
+  if (boardExportGuard(prompt) && !guardAcknowledged) {
+    guardAcknowledged = true;
+    setStatus('⚠ you\'re asking for a case/mount but the attached model\'s role is "printable" — it will be MERGED into the print. Set its role to 👁 reference or 📐 fit/cutout on the chip, or press Generate again to proceed as-is.', 'error');
+    return;
+  }
+  guardAcknowledged = false;
   $('go').disabled = $('new').disabled = true;
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
@@ -490,41 +497,55 @@ $('meshfile').onchange = async () => {
   }
 };
 
-const ROLE_ICONS = { printable: '🖨', reference: '👁', negative: '⛔' };
+const ROLES = { printable: '🖨 printable', reference: '👁 reference', fit_cutout: '📐 fit/cutout',
+                assembly: '🧩 assembly', negative: '⛔ negative' };
+const meshRoles = {};  // id -> role, for the accidental-board-export guard
 function attachMesh(m) {
   if (m.kind !== 'svg' && meshIds.length >= 3) { setStatus('max 3 base meshes', 'error'); return; }
   meshIds.push(m.id);
+  meshRoles[m.id] = m.role ?? 'printable';
   const chip = document.createElement('span');
   chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px';
   const label = document.createElement('span');
   label.textContent = `📦 ${m.name}`;
+  const inclusion = r => (r === 'printable' || r === 'assembly') ? 'included in export: YES' : 'included in export: no (design reference)';
   const info = [m.format?.toUpperCase(), m.tris ? `${m.tris.toLocaleString()} tris` : null,
+                m.bodies > 1 ? `${m.bodies} bodies` : null,
                 m.bounds_max ? `${(m.bounds_max[0] - m.bounds_min[0]).toFixed(0)}×${(m.bounds_max[1] - m.bounds_min[1]).toFixed(0)}×${(m.bounds_max[2] - m.bounds_min[2]).toFixed(0)}mm` : null,
                 m.watertight === false ? '⚠ not watertight' : null].filter(Boolean).join(' · ');
-  label.title = info;
-  let role = m.role ?? 'printable';
-  const roleBtn = document.createElement('button');
-  const setRoleLabel = () => { roleBtn.textContent = ROLE_ICONS[role]; roleBtn.title = `role: ${role} (click to cycle) — printable / reference-only / negative space`; };
-  if (m.kind !== 'svg') {
-    setRoleLabel();
-    roleBtn.style.cssText = 'padding:0 3px;background:none';
-    roleBtn.onclick = async () => {
-      role = role === 'printable' ? 'reference' : role === 'reference' ? 'negative' : 'printable';
-      setRoleLabel();
-      await api(`/uploads/${m.id}`, { role }, 'PATCH').catch(() => {});
-    };
+  const setTitle = () => { label.title = info + ' · ' + inclusion(meshRoles[m.id]); };
+  setTitle();
+  const roleSel = document.createElement('select');
+  roleSel.style.cssText = 'background:#14161a;color:#aab;border:1px solid #3a3f48;border-radius:4px;font-size:11px;padding:1px';
+  roleSel.title = 'how this model is used: printable/assembly go into the output; reference/fit-cutout/negative only shape the design';
+  for (const [val, txt] of Object.entries(ROLES)) {
+    const o = document.createElement('option');
+    o.value = val; o.textContent = txt; o.selected = val === meshRoles[m.id];
+    roleSel.appendChild(o);
   }
+  roleSel.onchange = async () => {
+    meshRoles[m.id] = roleSel.value;
+    setTitle();
+    await api(`/uploads/${m.id}`, { role: roleSel.value }, 'PATCH').catch(() => {});
+  };
   const x = document.createElement('b');
   x.textContent = '✕';
   x.style.cssText = 'cursor:pointer;color:#ff7b72';
-  x.onclick = () => { meshIds = meshIds.filter(id => id !== m.id); chip.remove(); };
-  chip.append(label, ...(m.kind !== 'svg' ? [roleBtn] : []), x);
+  x.onclick = () => { meshIds = meshIds.filter(id => id !== m.id); delete meshRoles[m.id]; chip.remove(); };
+  chip.append(label, ...(m.kind !== 'svg' ? [roleSel] : []), x);
   $('meshchips').appendChild(chip);
   const base = meshIds.length > 1
     ? `${meshIds.length} meshes attached — describe how to integrate them`
     : `base model attached (${info || 'ok'}) — describe what to add or change`;
   if (m.warning) setStatus(`⚠ ${m.warning}`, 'error');
   else setStatus(base, 'good');
+}
+function boardExportGuard(prompt) {
+  // asking for a case/enclosure around meshes that are all still 'printable' is
+  // usually a mistake: the real-world board would get merged into the print
+  const asksAround = /\b(case|enclosure|housing|holder|mount|around|shell|cover)\b/i.test(prompt);
+  const allPrintable = meshIds.length && meshIds.every(id => ['printable', 'assembly'].includes(meshRoles[id]));
+  return asksAround && allPrintable && meshIds.length >= 1;
 }
 async function uploadMeshFile(f) {
   const isBitmap = /image\/(png|jpe?g)/.test(f.type);
