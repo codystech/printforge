@@ -607,10 +607,32 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
     mesh_id = uuid.uuid4().hex[:12]
     src = UPLOADS_DIR / f"{mesh_id}{ext}"
     src.write_bytes(raw)
+    bodies_detail = []
     try:
         m = trimesh.load(src, force="mesh")
         if ext in {".step", ".stp"}:
+            fix = trimesh.transformations.rotation_matrix(3.141592653589793 / 2, [1, 0, 0])
             m.apply_scale(1000)  # cascadio emits GLB meters; STEP dimensions are mm
+            m.apply_transform(fix)  # GLB Y-up -> OpenSCAD Z-up
+            # CAD assemblies keep NAMED bodies (connectors!) — extract them with real
+            # positions so cutouts can be derived instead of guessed
+            try:
+                scene = trimesh.load(src)
+                if hasattr(scene, "graph"):
+                    for node in scene.graph.nodes_geometry:
+                        tf, gname = scene.graph[node]
+                        g = scene.geometry[gname].copy()
+                        g.apply_transform(tf)
+                        g.apply_scale(1000)
+                        g.apply_transform(fix)
+                        bodies_detail.append({
+                            "name": str(gname)[:60],
+                            "min": [round(float(v), 1) for v in g.bounds[0]],
+                            "max": [round(float(v), 1) for v in g.bounds[1]],
+                        })
+                bodies_detail = bodies_detail[:28]
+            except Exception:
+                bodies_detail = []
     except Exception as e:
         src.unlink(missing_ok=True)
         raise HTTPException(422, f"could not read {ext} file: {e}")
@@ -649,6 +671,7 @@ def _register_mesh(raw: bytes, filename: str) -> dict:
             "bounds_min": [round(v, 1) for v in m.bounds[0]],
             "bounds_max": [round(v, 1) for v in m.bounds[1]],
             "tris": int(len(m.faces)), "bodies": bodies,
+            "bodies_detail": bodies_detail,
             "watertight": bool(m.is_watertight),
             "warning": warning,
             "sections": sections}
@@ -800,6 +823,19 @@ def _mesh_note(mesh_id: str) -> str:
     }.get(role, "")
     info_note = (f"\n(format: {meta.get('format', 'stl')}, {meta.get('tris', '?')} "
                  f"triangles, watertight: {meta.get('watertight')})")
+    detail = meta.get("bodies_detail") or []
+    if detail:
+        rows = "\n".join(f"  {b['name']}: {b['min']} -> {b['max']}" for b in detail)
+        info_note += (
+            "\nNAMED CAD BODIES inside this model (mm, same coordinates as the import — "
+            "connector names reveal the real ports):\n" + rows +
+            "\nDerive every port cutout from these actual body positions/sizes (case "
+            "side, center, opening size) instead of assuming standard layouts. Include "
+            "a comment block in the file: CUTOUT DETECTION REPORT listing each port: "
+            "side, center, cutout size, clearance added, source (STEP body name), and "
+            "confidence high/medium/low. Ports without a matching named body get a "
+            "conservative oversized window and confidence=low — never fake precision."
+        )
     secs = "".join(
         f"\n  at z={s['z']}: x {s['x'][0]}..{s['x'][1]}, y {s['y'][0]}..{s['y'][1]}"
         for s in meta.get("sections", [])

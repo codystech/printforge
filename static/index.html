@@ -116,7 +116,14 @@
     <div id="lib"></div>
   </details>
 </div>
-<div id="viewer"></div>
+<div id="viewer">
+  <div style="position:absolute;top:8px;right:8px;display:flex;gap:6px;z-index:5">
+    <button id="vfit" class="secondary" style="padding:4px 10px;font-size:12px" title="zoom to fit">⛶</button>
+    <button id="vtop" class="secondary" style="padding:4px 10px;font-size:12px" title="top view (check lid text & cutouts)">⬆ top</button>
+    <button id="vfront" class="secondary" style="padding:4px 10px;font-size:12px" title="front view">front</button>
+    <button id="vside" class="secondary" style="padding:4px 10px;font-size:12px" title="side view">side</button>
+  </div>
+</div>
 
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.js", "three/addons/": "./vendor/" } }
@@ -138,14 +145,26 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.2));
 const dir = new THREE.DirectionalLight(0xffffff, 1.5);
 dir.position.set(1, 1, 2);
 scene.add(dir);
-// Bambu P1S bed: 256x256, origin at front-left corner
+// OpenSCAD models are Z-up but OrbitControls feels right only with Y-up.
+// Render everything inside a rotated group: natural orbit, correct top view.
+const world = new THREE.Group();
+world.rotation.x = -Math.PI / 2;
+scene.add(world);
+const scadToWorld = v => new THREE.Vector3(v.x, v.z, -v.y);
+// Bambu bed 256x256, origin at front-left corner (grid lives in screen-floor space)
 const grid = new THREE.GridHelper(256, 16, 0x3a3f48, 0x24272e);
-grid.rotation.x = Math.PI / 2;
-grid.position.set(128, 128, 0);
+grid.position.set(128, 0, -128);
 scene.add(grid);
 const origin = new THREE.AxesHelper(20);
-scene.add(origin);
-let mesh = null;
+world.add(origin);
+let mesh = null, lastFit = null;
+function setCam(fx, fy, fz) {
+  if (!lastFit) return;
+  const { c, r } = lastFit;
+  controls.target.copy(c);
+  camera.position.set(c.x + fx * r, c.y + fy * r, c.z + fz * r);
+  needsRender = true;
+}
 
 function resize() {
   camera.aspect = viewer.clientWidth / viewer.clientHeight;
@@ -154,9 +173,8 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 resize();
-camera.up.set(0, 0, 1);
-camera.position.set(240, -180, 160);
-controls.target.set(128, 128, 0);
+camera.position.set(300, 220, 60);
+controls.target.set(128, 15, -128);
 let needsRender = true;
 controls.addEventListener('change', () => { needsRender = true; });
 window.addEventListener('resize', () => { needsRender = true; });
@@ -169,16 +187,13 @@ const loader = new STLLoader();
 async function showStl(id, fit) {
   const geo = loader.parse(await (await fetch(`/stl/${id}`)).arrayBuffer());
   geo.computeVertexNormals();
-  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  if (mesh) { world.remove(mesh); mesh.geometry.dispose(); }
   mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xe8734a, roughness: 0.55, metalness: 0.05 }));
-  scene.add(mesh);
+  world.add(mesh);
   needsRender = true;
-  if (fit) {
-    geo.computeBoundingSphere();
-    const { center, radius } = geo.boundingSphere;
-    controls.target.copy(center);
-    camera.position.set(center.x + radius * 1.8, center.y - radius * 1.8, center.z + radius * 1.4);
-  }
+  geo.computeBoundingSphere();
+  lastFit = { c: scadToWorld(geo.boundingSphere.center), r: Math.max(20, geo.boundingSphere.radius) };
+  if (fit) setCam(1.4, 1.1, 1.4);
 }
 
 // --- app state ---
@@ -729,6 +744,10 @@ function renderLibrary() {
 
 // --- init ---
 $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('go').click(); } });
+$('vfit').onclick = () => setCam(1.4, 1.1, 1.4);
+$('vtop').onclick = () => setCam(0, 2.4, 0.001);
+$('vfront').onclick = () => setCam(0, 0.2, 2.4);
+$('vside').onclick = () => setCam(2.4, 0.2, 0);
 fetch('/profiles').then(r => r.json()).then(d => {
   const saved = localStorage.getItem('pf_profile');
   for (const p of d.profiles) {
