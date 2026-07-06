@@ -53,7 +53,8 @@ class GenerateRequest(BaseModel):
     prompt: str
     current_scad: str | None = None
     image: str | None = None  # data URL (photo/sketch reference)
-    mesh_id: str | None = None  # uploaded base mesh to remix
+    mesh_id: str | None = None  # uploaded base mesh to remix (legacy single)
+    mesh_ids: list[str] | None = None  # multiple base meshes to integrate
     parent_id: str | None = None  # library model this refine builds on (intent lineage)
 
 
@@ -69,6 +70,7 @@ class RenameRequest(BaseModel):
 class SpecRequest(BaseModel):
     prompt: str
     mesh_id: str | None = None
+    mesh_ids: list[str] | None = None
 
 
 def parse_params(scad: str) -> list[dict]:
@@ -112,7 +114,8 @@ def call_codex(messages: list[dict], images: list[str] | None = None) -> str:
     return strip_fences(out.read_text())
 
 
-def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None) -> str:
+def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None,
+                    effort: str | None = None) -> str:
     """Have codex EDIT the file in a scratch workspace instead of re-printing it —
     wholesale rewrites of long files reliably drop unrelated features."""
     job = WORK_DIR / f"edit-{uuid.uuid4().hex}"
@@ -128,6 +131,8 @@ def call_codex_edit(scad: str, instruction: str, images: list[str] | None = None
     )
     cmd = ["codex", "exec", "-C", str(job), "-s", "workspace-write",
            "--skip-git-repo-check", "--ephemeral"]
+    if effort:  # reviews don't need high reasoning; halves QA latency
+        cmd += ["-c", f'model_reasoning_effort="{effort}"']
     for img in images or []:
         cmd += ["-i", img]
     cmd.append("-")
@@ -312,7 +317,8 @@ async def vision_qa(prompt: str, scad: str, stl: Path,
         return scad, stl, "skipped"
     edited = await asyncio.to_thread(
         call_codex_edit, scad,
-        qa_prompt(prompt, "(the code is model.scad in this directory)", qa_notes), images
+        qa_prompt(prompt, "(the code is model.scad in this directory)", qa_notes), images,
+        "medium",
     )
     if edited.strip() == scad.strip():
         return scad, stl, "passed"
@@ -523,6 +529,27 @@ async def import_url(req: ImportUrlRequest):
     return _register_mesh(raw, name)
 
 
+def _mesh_ids(req) -> list[str]:
+    return req.mesh_ids or ([req.mesh_id] if req.mesh_id else [])
+
+
+def _all_mesh_notes(ids: list[str]) -> str | None:
+    if not ids:
+        return None
+    notes = [f"[MESH {chr(65 + i)}] {_mesh_note(mid)}" for i, mid in enumerate(ids[:3])]
+    if len(notes) > 1:
+        notes.append(
+            "MULTIPLE base meshes: position them relative to each other exactly as the "
+            "request describes (e.g. a board mounted inside a case). Translate/rotate "
+            "each import into place, then ADD the connecting geometry — standoffs, "
+            "screw bosses, brackets — sized from the meshes' real dimensions above and "
+            "fused into the part that carries them. For well-known hardware (Raspberry "
+            "Pi, Arduino, SSDs) use their standard mounting-hole layouts from your "
+            "knowledge. Keep each import and all connectors parameterized."
+        )
+    return "\n\n".join(notes)
+
+
 def _mesh_note(mesh_id: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{12}", mesh_id):
         raise HTTPException(400, "bad mesh id")
@@ -557,7 +584,7 @@ def _mesh_note(mesh_id: str) -> str:
 
 @app.post("/spec")
 async def spec(req: SpecRequest):
-    mesh_note = _mesh_note(req.mesh_id) if req.mesh_id else None
+    mesh_note = _all_mesh_notes(_mesh_ids(req))
     text = await call_llm([{"role": "user", "content": spec_prompt(req.prompt, mesh_note)}])
     return {"spec": text}
 
@@ -602,7 +629,7 @@ async def generate(req: GenerateRequest):
             p = render_png(cur, cur.with_name(f"{cur.stem}_{tag}.png"), camera=cam)
             if p:
                 images.append(str(p))
-    mesh_note = _mesh_note(req.mesh_id) if req.mesh_id else None
+    mesh_note = _all_mesh_notes(_mesh_ids(req))
     if req.current_scad and LLM_BACKEND == "codex":
         # refines edit the existing file in place — reprinting long files wholesale
         # reliably drops unrelated features
@@ -658,7 +685,8 @@ async def generate(req: GenerateRequest):
     if LLM_BACKEND == "codex" and QA_CHECK:
         # diff against the PREVIOUS state for refines, not the pristine upload —
         # otherwise QA re-litigates (and reverts) intentional changes from earlier turns
-        base_stl = (UPLOADS_DIR / f"{req.mesh_id}.stl") if req.mesh_id else None
+        first_mesh = next(iter(_mesh_ids(req)), None)
+        base_stl = (UPLOADS_DIR / f"{first_mesh}.stl") if first_mesh else None
         if req.current_scad:
             try:
                 base_stl = render_stl(req.current_scad, {})

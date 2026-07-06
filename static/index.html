@@ -78,7 +78,7 @@
     <button id="orgbtn" class="secondary" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)">🧬</button>
     <input id="orgfile" type="file" accept="image/*" hidden>
     <input id="orgsize" type="number" value="80" min="10" max="250" hidden style="width:52px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:4px" title="target size (mm)">
-    <span id="meshchip" style="display:none;align-items:center;gap:6px;font-size:12px;color:#aab"><span id="meshname"></span><b id="meshclear" style="cursor:pointer;color:#ff7b72">✕</b></span>
+    <span id="meshchips" style="display:inline-flex;flex-wrap:wrap;gap:6px;font-size:12px;color:#aab"></span>
   </div>
   <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" style="display:none;width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px">
   <div class="btnrow"><button id="go">Generate</button><button id="specbtn" class="secondary" title="expand your prompt into an editable design spec first">✍ Spec</button></div>
@@ -162,7 +162,7 @@ async function showStl(id, fit) {
 
 // --- app state ---
 const $ = id => document.getElementById(id);
-let scad = null, stlId = null, refImage = null, meshId = null, currentModelId = null;
+let scad = null, stlId = null, refImage = null, meshIds = [], currentModelId = null;
 
 let tick = null;
 function setStatus(msg, cls = '') {
@@ -252,7 +252,7 @@ async function generate(fresh) {
   $('go').disabled = $('new').disabled = true;
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
-    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_id: meshId, parent_id: fresh ? null : currentModelId });
+    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_ids: meshIds.length ? meshIds : null, parent_id: fresh ? null : currentModelId });
     let qaMsg = r.qa === 'passed' ? 'vision check: passed'
       : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
       : '';
@@ -285,7 +285,7 @@ $('specbtn').onclick = async () => {
   $('specbtn').disabled = true;
   setBusyStatus('Drafting design spec…');
   try {
-    const r = await api('/spec', { prompt, mesh_id: meshId });
+    const r = await api('/spec', { prompt, mesh_ids: meshIds.length ? meshIds : null });
     $('specbox').value = r.spec;
     $('specbox').style.display = 'block';
     $('specgen').style.display = 'block';
@@ -325,8 +325,6 @@ $('imgfile').onchange = () => {
   $('imgfile').value = '';
 };
 // --- base mesh input ---
-function clearMesh() { meshId = null; $('meshchip').style.display = 'none'; }
-$('meshclear').onclick = clearMesh;
 $('meshbtn').onclick = () => $('meshfile').click();
 $('meshfile').onchange = async () => {
   const f = $('meshfile').files[0];
@@ -344,11 +342,23 @@ $('meshfile').onchange = async () => {
 };
 
 function attachMesh(m) {
-  meshId = m.id;
-  $('meshname').textContent = `📦 ${m.name}`;
-  $('meshchip').style.display = 'inline-flex';
-  setStatus('base model attached — describe what to add or change', 'good');
+  if (meshIds.length >= 3) { setStatus('max 3 base meshes', 'error'); return; }
+  meshIds.push(m.id);
+  const chip = document.createElement('span');
+  chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px';
+  const label = document.createElement('span');
+  label.textContent = `📦 ${m.name}`;
+  const x = document.createElement('b');
+  x.textContent = '✕';
+  x.style.cssText = 'cursor:pointer;color:#ff7b72';
+  x.onclick = () => { meshIds = meshIds.filter(id => id !== m.id); chip.remove(); };
+  chip.append(label, x);
+  $('meshchips').appendChild(chip);
+  setStatus(meshIds.length > 1
+    ? `${meshIds.length} meshes attached — describe how to integrate them`
+    : 'base model attached — describe what to add or change', 'good');
 }
+function clearMesh() { meshIds = []; $('meshchips').innerHTML = ''; }
 $('linkbtn').onclick = () => {
   const li = $('linkinput');
   li.style.display = li.style.display === 'none' ? 'block' : 'none';
