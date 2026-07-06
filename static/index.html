@@ -82,6 +82,7 @@
     <span id="meshchips" style="display:inline-flex;flex-wrap:wrap;gap:6px;font-size:12px;color:#aab"></span>
   </div>
   <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" style="display:none;width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px">
+  <select id="profilesel" title="active printer profile: feeds bed size, nozzle, material, clearances and weight estimates into every spec and generation" style="width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px;font-size:12px"></select>
   <div class="btnrow"><button id="go">Generate</button><button id="specbtn" class="secondary" title="expand your prompt into an editable design spec first">✍ Spec</button></div>
   <textarea id="specbox" style="display:none;height:180px;font-size:12px" placeholder="design spec — edit anything, then Generate from spec"></textarea>
   <button id="specgen" style="display:none">Generate from spec</button>
@@ -372,13 +373,17 @@ function showModel(r, statusMsg, cls = 'good') {
       $('diffinfo').style.display = 'block';
     }
   }).catch(() => {});
+  modelProfile = r.profile_used ?? r.meta?.profile?.name ?? null;
   const rep = r.report ?? r.meta?.report;
   $('printinfo').style.display = rep?.bbox_mm ? 'block' : 'none';
   if (rep?.bbox_mm) $('printinfo').textContent =
     `${rep.bbox_mm.join(' × ')} mm · ${rep.parts} part${rep.parts > 1 ? 's' : ''}` +
-    (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g PLA` : '') +
+    (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g ${rep.material ?? 'PLA'}` : '') +
     (rep.watertight ? ' · watertight ✓' : ' · ⚠ not watertight') +
-    (rep.measured ? ` · measured ${rep.measured}` : '');
+    (rep.measured ? ` · measured ${rep.measured}` : '') +
+    ` · 🖨 ${rep.profile ?? modelProfile ?? 'unknown/legacy'}` +
+    (rep.bed_fit && rep.bed_fit !== 'ok' ? ` · ⚠ ${rep.bed_fit}` : '');
+  if (r.profile_override) statusMsg += ` — ⚠ ${r.profile_override}`;
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
@@ -387,7 +392,7 @@ function showModel(r, statusMsg, cls = 'good') {
   return showStl(stlId, true).then(() => setStatus(statusMsg, cls));
 }
 
-let guardAcknowledged = false;
+let guardAcknowledged = false, profileAcknowledged = false, modelProfile = null;
 async function generate(fresh) {
   const prompt = $('prompt').value.trim();
   if (!prompt) return;
@@ -397,10 +402,16 @@ async function generate(fresh) {
     return;
   }
   guardAcknowledged = false;
+  if (!fresh && modelProfile && modelProfile !== $('profilesel').value && !profileAcknowledged) {
+    profileAcknowledged = true;
+    setStatus(`⚠ this model was generated for "${modelProfile}" but the active profile is "${$('profilesel').value}". Press again to refine for the new printer (the AI will re-check walls/clearances/bed fit).`, 'error');
+    return;
+  }
+  profileAcknowledged = false;
   $('go').disabled = $('new').disabled = true;
   setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
   try {
-    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_ids: meshIds.length ? meshIds : null, parent_id: fresh ? null : currentModelId });
+    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_ids: meshIds.length ? meshIds : null, parent_id: fresh ? null : currentModelId, profile: $('profilesel').value || null });
     let qaMsg = r.qa === 'passed' ? 'vision check: passed'
       : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
       : '';
@@ -445,7 +456,8 @@ $('specbtn').onclick = async () => {
   $('specbtn').disabled = true;
   setBusyStatus('Drafting design spec…');
   try {
-    const r = await api('/spec', { prompt, mesh_ids: meshIds.length ? meshIds : null });
+    const r = await api('/spec', { prompt, mesh_ids: meshIds.length ? meshIds : null, profile: $('profilesel').value || null });
+    if (r.override) setStatus(`⚠ ${r.override}`, 'error');
     $('specbox').value = r.spec;
     $('specbox').style.display = 'block';
     $('specgen').style.display = 'block';
@@ -632,7 +644,7 @@ $('libsearch').oninput = () => renderLibrary();
 function renderLibrary() {
   const q = $('libsearch').value.trim().toLowerCase();
   const models = q
-    ? libCache.filter(m => (m.name + ' ' + (m.prompt ?? '')).toLowerCase().includes(q))
+    ? libCache.filter(m => (m.name + ' ' + (m.prompt ?? '') + ' ' + (m.profile?.name ?? '')).toLowerCase().includes(q))
     : libCache;
   const lib = $('lib');
   lib.innerHTML = '';
@@ -647,7 +659,7 @@ function renderLibrary() {
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = m.name;
-    name.title = m.prompt;
+    name.title = (m.prompt ?? '') + `\n🖨 ${m.profile?.name ?? 'unknown/legacy'}`;
     const up = document.createElement('button');
     up.textContent = '👍';
     up.style.opacity = m.rating === 1 ? '1' : '.35';
@@ -709,6 +721,17 @@ function renderLibrary() {
 
 // --- init ---
 $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('go').click(); } });
+fetch('/profiles').then(r => r.json()).then(d => {
+  const saved = localStorage.getItem('pf_profile');
+  for (const p of d.profiles) {
+    const o = document.createElement('option');
+    o.value = p.name;
+    o.textContent = `🖨 ${p.name}` + (p.multicolor ? ' · AMS' : '');
+    o.selected = saved ? p.name === saved : p.name === d.default;
+    $('profilesel').appendChild(o);
+  }
+}).catch(() => {});
+$('profilesel').onchange = () => localStorage.setItem('pf_profile', $('profilesel').value);
 fetch('/presets').then(r => r.json()).then(p => { $('presets').value = p.text; }).catch(() => {});
 let presetsTimer = null;
 $('presets').oninput = () => {

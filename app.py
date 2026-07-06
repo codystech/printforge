@@ -56,6 +56,7 @@ class GenerateRequest(BaseModel):
     mesh_id: str | None = None  # uploaded base mesh to remix (legacy single)
     mesh_ids: list[str] | None = None  # multiple base meshes to integrate
     parent_id: str | None = None  # library model this refine builds on (intent lineage)
+    profile: str | None = None  # active printer profile name
 
 
 class RenderRequest(BaseModel):
@@ -71,6 +72,7 @@ class SpecRequest(BaseModel):
     prompt: str
     mesh_id: str | None = None
     mesh_ids: list[str] | None = None
+    profile: str | None = None
 
 
 def parse_params(scad: str) -> list[dict]:
@@ -192,27 +194,100 @@ def render_stl(scad: str, params: dict) -> Path:
     return stl_file
 
 
-def print_report(stl_path: Path) -> dict:
+def print_report(stl_path: Path, profile: dict | None = None) -> dict:
     """Bounding box, weight estimate, connectivity — the numbers a maker checks first."""
     m = trimesh.load_mesh(stl_path)
+    density = (profile or {}).get("density", 1.24)
     vol_cm3 = float(abs(m.volume)) / 1000.0 if m.is_volume else None
-    return {
+    out = {
         "bbox_mm": [round(float(v), 1) for v in m.extents],
         "watertight": bool(m.is_watertight),
         "parts": len(m.split(only_watertight=False)),
-        "est_grams_pla": round(vol_cm3 * 1.24, 1) if vol_cm3 else None,
+        "est_grams_pla": round(vol_cm3 * density, 1) if vol_cm3 else None,
     }
+    if profile:
+        out["profile"] = profile["name"]
+        out["material"] = profile["material"]
+        bed = profile["bed_mm"]
+        fits = all(e <= b for e, b in zip(m.extents, bed))
+        out["bed_fit"] = "ok" if fits else (
+            f"EXCEEDS {profile['printer']} bed "
+            f"({bed[0]}x{bed[1]}x{bed[2]}mm)")
+    return out
+
+
+def _profile(name, printer, bed, material, density, ams, overhang=50,
+             notes="prefer support-free geometry; tree supports acceptable"):
+    return {"name": name, "printer": printer, "bed_mm": bed, "nozzle": 0.4,
+            "layer": 0.2, "material": material, "density": density,
+            "min_wall": 2.0, "fit_clearance": 0.2, "snap_clearance": 0.15,
+            "loose_clearance": 0.4, "min_detail_depth": 0.8,
+            "max_overhang_deg": overhang, "multicolor": ams, "supports": notes}
+
+
+DEFAULT_PROFILES = {p["name"]: p for p in [
+    _profile("Bambu A1 - 0.4mm PLA", "Bambu A1", [256, 256, 256], "PLA", 1.24, True),
+    _profile("Bambu A1 - 0.4mm PETG", "Bambu A1", [256, 256, 256], "PETG", 1.27, True, 45),
+    _profile("Bambu P1S - 0.4mm PLA", "Bambu P1S", [256, 256, 256], "PLA", 1.24, True),
+    _profile("Bambu P1S - 0.4mm PETG", "Bambu P1S", [256, 256, 256], "PETG", 1.27, True, 45),
+    _profile("Generic FDM - 220x220x250 PLA", "Generic FDM", [220, 220, 250], "PLA", 1.24, False),
+]}
+PROFILES_FILE = Path(__file__).parent / "profiles.json"
+DEFAULT_PROFILE = "Generic FDM - 220x220x250 PLA"
+
+
+def all_profiles() -> dict:
+    out = dict(DEFAULT_PROFILES)
+    if PROFILES_FILE.exists():
+        try:
+            out.update(json.loads(PROFILES_FILE.read_text()))
+        except Exception:
+            pass
+    return out
+
+
+def get_profile(name: str | None) -> dict:
+    profs = all_profiles()
+    return profs.get(name or "", profs.get(DEFAULT_PROFILE) or next(iter(profs.values())))
+
+
+def resolve_profile(name: str | None, prompt: str) -> tuple[dict, str | None]:
+    """Active profile, unless the prompt explicitly names a different printer."""
+    active = get_profile(name)
+    pl = prompt.lower()
+    for prof in all_profiles().values():
+        printer = prof["printer"].lower()
+        if printer != "generic fdm" and printer in pl and prof["printer"] != active["printer"]:
+            # same material as active if such a variant exists
+            for cand in all_profiles().values():
+                if cand["printer"] == prof["printer"] and cand["material"] == active["material"]:
+                    return cand, f"prompt names {prof['printer']}, overriding active profile for this job"
+            return prof, f"prompt names {prof['printer']}, overriding active profile for this job"
+    return active, None
+
+
+def profile_block(p: dict, override: str | None = None) -> str:
+    o = f" ({override})" if override else ""
+    return (
+        f"\nPRINTER PROFILE{o} — hard print constraints for this job, overriding any "
+        f"conflicting user defaults:\n"
+        f"profile: {p['name']} | printer: {p['printer']} | build volume: "
+        f"{p['bed_mm'][0]}x{p['bed_mm'][1]}x{p['bed_mm'][2]}mm (the print layout AND every "
+        f"part must fit inside) | nozzle: {p['nozzle']} | layer: {p['layer']} | material: "
+        f"{p['material']} | min wall: {p['min_wall']} | fit clearance: {p['fit_clearance']} "
+        f"| snap-fit clearance: {p['snap_clearance']} | loose clearance: "
+        f"{p['loose_clearance']} | min emboss/deboss depth: {p['min_detail_depth']} | max "
+        f"unsupported overhang: {p['max_overhang_deg']}deg | multicolor/AMS: "
+        f"{'yes' if p['multicolor'] else 'NO - single color only'} | supports: {p['supports']}\n"
+    )
 
 
 PRESETS_FILE = Path(__file__).parent / "presets.txt"
-DEFAULT_PRESETS = """# printing assumptions (edit to match your printer/results)
-nozzle = 0.4, layer height = 0.2
-slip fit clearance = 0.2, loose fit = 0.4
-minimum wall = 2.0
-raised text depth = 1.2, engraved text depth = 0.8
-# add measured objects you design around, e.g.:
+DEFAULT_PRESETS = """# your MEASURED objects (print settings now come from the printer profile)
+# e.g.:
 # phone width = 78 (with case), phone thickness = 12
-# desk edge thickness = 25"""
+# desk edge thickness = 25
+# my calibrated slip fit = 0.2 (from the calibration coupon)"""
 
 
 def presets_block() -> str:
@@ -738,12 +813,39 @@ def _mesh_note(mesh_id: str) -> str:
     )
 
 
+@app.get("/profiles")
+async def list_profiles():
+    return {"profiles": list(all_profiles().values()), "default": DEFAULT_PROFILE}
+
+
+class CustomProfileRequest(BaseModel):
+    profile: dict
+
+
+@app.put("/profiles/custom")
+async def set_custom_profile(req: CustomProfileRequest):
+    base = get_profile(DEFAULT_PROFILE).copy()
+    base.update({k: v for k, v in req.profile.items() if k in base})
+    base["name"] = str(req.profile.get("name", "Custom Printer"))[:50]
+    customs = {}
+    if PROFILES_FILE.exists():
+        try:
+            customs = json.loads(PROFILES_FILE.read_text())
+        except Exception:
+            pass
+    customs[base["name"]] = base
+    PROFILES_FILE.write_text(json.dumps(customs, indent=1))
+    return base
+
+
 @app.post("/spec")
 async def spec(req: SpecRequest):
     mesh_note = _all_mesh_notes(_mesh_ids(req))
+    prof, override = resolve_profile(req.profile, req.prompt)
     text = await call_llm([{"role": "user",
-                            "content": spec_prompt(req.prompt, mesh_note) + presets_block()}])
-    return {"spec": text}
+                            "content": spec_prompt(req.prompt, mesh_note)
+                                       + profile_block(prof, override) + presets_block()}])
+    return {"spec": text, "profile": prof["name"], "override": override}
 
 
 CALIBRATION_SCAD = """// PrintForge tolerance calibration coupon
@@ -859,6 +961,13 @@ async def generate(req: GenerateRequest):
             if p:
                 images.append(str(p))
     mesh_note = _all_mesh_notes(_mesh_ids(req))
+    prof, prof_override = resolve_profile(req.profile, req.prompt)
+    prof_note = profile_block(prof, prof_override)
+    parent_prof = _parent_meta(req.parent_id).get("profile", {}).get("name")
+    if req.current_scad and parent_prof and parent_prof != prof["name"]:
+        prof_note += (f"\nPROFILE CHANGE: this model was generated for '{parent_prof}' "
+                      f"and is now targeting '{prof['name']}' — re-check wall thickness, "
+                      "clearances, overhangs and bed fit against the new profile.\n")
     lock_issues: list[str] = []
     if req.current_scad and LLM_BACKEND == "codex":
         # refines edit the existing file in place — reprinting long files wholesale
@@ -878,7 +987,7 @@ async def generate(req: GenerateRequest):
                 )
         except Exception:
             pass
-        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + presets_block() + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + prof_note + presets_block() + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
             rules_block(load_rules(req.parent_id)) +
             part_state_block(load_part_state(req.parent_id)) +
@@ -910,7 +1019,8 @@ async def generate(req: GenerateRequest):
     else:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)
-                                          + presets_block() + _taste_example(req.prompt)},
+                                          + prof_note + presets_block()
+                                          + _taste_example(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
         scad = await call_llm(messages, images)
@@ -942,7 +1052,7 @@ async def generate(req: GenerateRequest):
                 ps_note = part_state_block(load_part_state(req.parent_id))
                 scad, stl, status = await vision_qa(
                     req.prompt, scad, stl, base_stl,
-                    load_intent(req.parent_id) + ([ps_note] if ps_note else []),
+                    load_intent(req.parent_id) + ([ps_note] if ps_note else []) + [prof_note],
                     load_rules(req.parent_id))
             except Exception as e:
                 print(f"vision QA failed: {e}")
@@ -965,13 +1075,14 @@ async def generate(req: GenerateRequest):
                 measured = "assembled"
             except HTTPException:
                 pass
-        report = await asyncio.to_thread(print_report, report_stl)
+        report = await asyncio.to_thread(print_report, report_stl, prof)
         report["measured"] = measured
     except Exception:
         report = {}
     meta_file = LIB_DIR / model_id / "meta.json"
     meta = json.loads(meta_file.read_text())
-    meta.update({"qa": qa, "backend": LAST_BACKEND, "report": report})
+    meta.update({"qa": qa, "backend": LAST_BACKEND, "report": report,
+                 "profile": dict(prof)})  # snapshot values, not just the name
     if load_part_state(req.parent_id):
         meta["part_state"] = load_part_state(req.parent_id)
     meta_file.write_text(json.dumps(meta))
@@ -988,7 +1099,8 @@ async def generate(req: GenerateRequest):
             "backend": LAST_BACKEND, "rules": load_rules(req.parent_id),
             "part_state": load_part_state(req.parent_id),
             "lock_violations": lock_issues, "report": report,
-            "print_warning_details": warning_details}
+            "print_warning_details": warning_details,
+            "profile_used": prof["name"], "profile_override": prof_override}
 
 
 @app.post("/render")

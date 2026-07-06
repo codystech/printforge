@@ -206,6 +206,8 @@ def spec_prompt(request: str, mesh_note: str | None = None) -> str:
         "markdown, at most ~15 short lines, using exactly these section labels:\n"
         "TARGET: overall dimensions in mm\n"
         "FEATURES: each feature with size and position\n"
+        "PRINTER: the active printer profile in use — name it exactly, and note if the "
+        "request overrode the selected profile\n"
         "PRINT: bed orientation, support needs, wall thicknesses\n"
         "PARTS: part/color layout if multi-part\n"
         "ATTACHED: for each attached model — its name, format, dimensions, role, "
