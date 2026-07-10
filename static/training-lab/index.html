@@ -191,19 +191,39 @@
         <p id="model-picker-error" class="field-error" role="alert"></p>
       </section>
 
-      <label class="form-row">Design specification<textarea id="new-spec" class="field" required rows="7" placeholder="Describe required geometry, dimensions, behavior, and success criteria"></textarea></label>
-      <label class="form-row">Printer profile<select id="new-profile" class="field" required><option value="">Loading printer profiles…</option></select></label>
+      <details class="form-collapse" open><summary>Design specification</summary>
+        <label class="form-row">Describe required geometry, dimensions, behavior, and success criteria<textarea id="new-spec" class="field" required rows="6" placeholder="Describe required geometry, dimensions, behavior, and success criteria"></textarea></label>
+      </details>
 
-      <section class="form-section">
-        <div class="section-heading"><span>Locked requirements</span><button id="add-lock" class="mini-button" type="button">Add requirement</button></div>
-        <div id="lock-editor" class="lock-editor"></div>
-        <label class="toggle advanced-toggle"><input id="advanced-locks" type="checkbox"><span>Advanced JSON mode</span></label>
-        <textarea id="new-locks" class="field" rows="5" hidden>[]</textarea>
-        <p id="locks-error" class="field-error" role="alert"></p>
-      </section>
+      <details class="form-collapse" open><summary>Printer profile</summary>
+        <label class="form-row">Printer profile<select id="new-profile" class="field" required><option value="">Loading printer profiles…</option></select></label>
+      </details>
 
-      <section class="form-section">
-        <div class="section-heading"><span>Stop controls</span><small>All runs are bounded.</small></div>
+      <details class="form-collapse" open><summary>Locked requirements</summary>
+        <div class="req-toolbar">
+          <select id="req-preset" class="field small" aria-label="Requirement preset"></select>
+          <button id="req-extract-btn" class="mini-button" type="button">Extract requirements from specification</button>
+          <button id="req-add" class="mini-button" type="button">Add requirement</button>
+        </div>
+        <div class="req-head" aria-hidden="true"><span>Category</span><span>Requirement</span><span>Value</span><span>Severity</span><span></span></div>
+        <div id="req-editor" class="req-editor"></div>
+        <div id="req-extract" class="req-extract" hidden></div>
+        <div id="req-summary" class="req-summary" aria-live="polite"></div>
+        <label class="toggle advanced-toggle"><input id="req-advanced" type="checkbox"><span>Advanced JSON mode (expert)</span></label>
+        <div id="req-json-wrap" hidden>
+          <textarea id="req-json" class="field" rows="8" spellcheck="false">[]</textarea>
+          <div class="req-json-actions">
+            <button id="req-json-copy" class="mini-button" type="button">Copy</button>
+            <button id="req-json-export" class="mini-button" type="button">Download</button>
+            <button id="req-json-import" class="mini-button" type="button">Import…</button>
+            <input id="req-json-file" type="file" accept="application/json,.json" hidden>
+            <button id="req-json-reset" class="mini-button" type="button">Reset to guided</button>
+          </div>
+        </div>
+        <p id="req-error" class="field-error" role="alert"></p>
+      </details>
+
+      <details class="form-collapse" open><summary>Run controls</summary>
         <div class="limits-grid">
           <label>Maximum iterations<input id="limit-iterations" class="field" type="number" min="1" max="50" value="5" required></label>
           <label>Maximum runtime (minutes)<input id="limit-runtime" class="field" type="number" min="1" max="10080" value="20" required></label>
@@ -212,10 +232,10 @@
           <label>Target quality score (optional)<input id="limit-target" class="field" type="number" min="0" max="100" placeholder="No target"></label>
         </div>
         <p id="run-estimate" class="estimate"></p>
-      </section>
+      </details>
 
       <p class="muted">Creates isolated versioned state only. Start is a separate action; no production model is overwritten and no rule is activated.</p>
-      <div class="header-actions"><button id="create-run-submit" class="button" type="submit" disabled>Create run</button><button class="button secondary" type="button" data-close-new-run>Cancel</button></div>
+      <div class="modal-actions"><button id="create-run-submit" class="button" type="submit" disabled>Create run</button><button class="button secondary" type="button" data-close-new-run>Cancel</button></div>
     </form>
   </dialog>
 

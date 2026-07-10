@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from parts import floating_starts, split_parts, write_3mf
 from prompts import SYSTEM_PROMPT, archetype_notes, qa_prompt, spec_prompt, user_prompt
 from evolution_lab import EvolutionAdapters, EvolutionLabConfig, create_router
+from evolution_lab.requirements import requirements_prompt_block, verify_requirements
 
 # "codex" shells out to the codex CLI (gpt-5.5, host only) and falls back to HTTP on failure
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "http")
@@ -1809,8 +1810,8 @@ Return one complete OpenSCAD model that follows the validated design specificati
 DESIGN SPECIFICATION (law):
 {context['validated_spec']}
 
-LOCKED REQUIREMENTS (must be present and satisfied):
-{json.dumps(context.get('locked_constraints', []), indent=2)}
+LOCKED REQUIREMENTS (must be present and satisfied; severity in brackets — HARD LOCK and FORBIDDEN are non-negotiable):
+{requirements_prompt_block(context.get('locked_constraints', []))}
 
 PRINTER PROFILE:
 {json.dumps(profile, indent=2)}
@@ -1840,8 +1841,8 @@ Edit the supplied model.scad IN PLACE with the smallest possible change. Do not 
 VALIDATED SPEC (law):
 {context['validated_spec']}
 
-HARD LOCKS (must remain exact):
-{json.dumps(context.get('locked_constraints', []), indent=2)}
+LOCKED REQUIREMENTS (severity in brackets — HARD LOCK and FORBIDDEN must hold exactly):
+{requirements_prompt_block(context.get('locked_constraints', []))}
 
 CONTROLLED MUTATION:
 {json.dumps(mutation, indent=2)}
@@ -1863,36 +1864,12 @@ Do not add an unrelated redesign. Do not claim QA, slicing, or physical validati
     }
 
 
-def _lab_constraint_findings(parent_scad: str, candidate_scad: str, locks: list) -> tuple[list[dict], list[str]]:
-    findings, failures = [], []
-    for index, lock in enumerate(locks):
-        if not isinstance(lock, dict):
-            findings.append({"issue_type": "lock_unverifiable", "severity": "error", "message": str(lock), "source": "constraint monitor"})
-            failures.append("critical_evidence_unavailable")
-            continue
-        kind, name = lock.get("type"), lock.get("name", f"lock-{index + 1}")
-        preserved = False
-        if kind == "module" and lock.get("name"):
-            before, after = module_block(parent_scad, lock["name"]), module_block(candidate_scad, lock["name"])
-            preserved = after is not None and (
-                not parent_scad.strip()
-                or (before is not None and re.sub(r"\s+", "", before) == re.sub(r"\s+", "", after))
-            )
-        elif kind == "parameter" and lock.get("name"):
-            pattern = re.compile(rf"^\s*{re.escape(lock['name'])}\s*=\s*([^;]+);", re.MULTILINE)
-            before, after = pattern.search(parent_scad), pattern.search(candidate_scad)
-            expected = lock.get("value")
-            preserved = bool(after and (
-                (not parent_scad.strip() and (expected is None or after.group(1).strip().strip('"') == str(expected).strip().strip('"')))
-                or (before and before.group(1).strip() == after.group(1).strip())
-            ))
-        elif kind == "literal" and lock.get("value") is not None:
-            literal = str(lock["value"])
-            preserved = literal in candidate_scad and (not parent_scad.strip() or literal in parent_scad)
-        if not preserved:
-            findings.append({"issue_type": "broken_hard_lock", "severity": "critical", "message": f"Hard lock not preserved: {name}", "source": "deterministic source diff"})
-            failures.append("broken_hard_lock" if kind in {"module", "parameter", "literal"} else "critical_evidence_unavailable")
-    return findings, failures
+def _lab_constraint_findings(parent_scad: str, candidate_scad: str, locks: list,
+                             report: dict | None = None, floats: list | None = None) -> tuple[list[dict], list[str]]:
+    """Deterministically verify guided/legacy locked requirements against the
+    rendered candidate. Delegates to the pure evolution_lab.requirements module so
+    the same logic is unit-tested without the generation stack."""
+    return verify_requirements(parent_scad, candidate_scad, report or {}, floats or [], locks or [])
 
 
 def _lab_ai_review(scad: str, context: dict, report: dict, issues: list[dict], images: list[str]) -> tuple[list[dict], int]:
@@ -1950,8 +1927,9 @@ def _lab_evaluate_candidate(scad: str, context: dict) -> dict:
         "message": f"Feature starts in mid-air near x={item.get('x')}, y={item.get('y')}, z={item.get('z')}mm",
         "source": "floating_starts",
     } for item in floats]
-    lock_issues, failure_codes = _lab_constraint_findings(context.get("parent_scad", ""), scad, context.get("locked_constraints", []))
+    lock_issues, failure_codes = _lab_constraint_findings(context.get("parent_scad", ""), scad, context.get("locked_constraints", []), report, floats)
     issues.extend(lock_issues)
+    lock_violated = any(item.get("severity") in {"critical", "warning"} for item in lock_issues)
     bed_ok = report.get("bed_fit") == "ok"
     if not bed_ok:
         failure_codes.append("build_volume_overflow")
@@ -1967,7 +1945,7 @@ def _lab_evaluate_candidate(scad: str, context: dict) -> dict:
     else:
         evidence.append({"category": "prompt_spec_adherence", "criterion": "no reference export scope", "points_awarded": 4, "points_possible": 4, "label": "MEASURED", "source": "run configuration", "summary": "No attached reference-only geometry in this run", "confidence": 1, "critical": False})
     if context.get("locked_constraints"):
-        evidence.append({"category": "prompt_spec_adherence", "criterion": "hard locks preserved", "points_awarded": 4 if not lock_issues else 0, "points_possible": 4, "label": "MEASURED", "source": "deterministic source diff", "summary": "All concrete locks preserved" if not lock_issues else "One or more locks failed", "confidence": 1, "critical": True})
+        evidence.append({"category": "prompt_spec_adherence", "criterion": "locked requirements preserved", "points_awarded": 4 if not lock_violated else 0, "points_possible": 4, "label": "MEASURED", "source": "deterministic constraint monitor", "summary": "All deterministically-checkable requirements preserved" if not lock_violated else "One or more requirements violated", "confidence": 1, "critical": True})
     preview = _lab_render_png(stl.with_suffix(".scad"), stl.with_name("lab-preview.png"), cancel_event)
     images = [str(preview)] if preview and preview.exists() else []
     ai_evidence, review_calls = _lab_ai_review(scad, context, report, issues, images)

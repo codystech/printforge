@@ -1,5 +1,6 @@
 import { CandidateViewer } from '/training-lab/viewer.js';
 import { renderLineage, renderScoreChart } from '/training-lab/charts.js';
+import { RequirementsBuilder, PRESET_LABELS, summarizeRequirement } from '/training-lab/requirements-builder.js';
 
 const $ = id => document.getElementById(id);
 const PIPELINE_STAGES = [
@@ -22,6 +23,7 @@ const state = {
   pair: [null, null], lastSequence: 0, pollTimer: null, lineage: null,
   viewers: [null, null], disposed: false, loadingRun: false,
   libraryModels: [], selectedModel: null, profiles: [], manualPair: null,
+  builder: null,
 };
 const isMobile = matchMedia('(max-width: 640px)').matches;
 
@@ -215,22 +217,38 @@ function renderPipeline() {
 
 function constraintEntries(run) {
   const source = run.constraints ?? run.locked_constraints ?? run.config?.locked_constraints ?? [];
-  if (Array.isArray(source)) return source.map(item => typeof item === 'string' ? { name: item } : item);
+  if (Array.isArray(source)) return source;
   return Object.entries(source).map(([name, value]) => typeof value === 'object' ? { name, ...value } : { name, value });
+}
+
+// Render one persisted locked requirement (guided v2, legacy v1, or plain string)
+// into a readable "Requirement: value" line with a severity badge.
+function describeConstraint(constraint) {
+  if (typeof constraint === 'string') return { label: constraint, severity: 'hard_lock' };
+  const severity = constraint.severity ?? 'hard_lock';
+  if (constraint.category || (constraint.type && constraint.value !== undefined && !['module', 'parameter', 'literal'].includes(constraint.type))) {
+    return { label: summarizeRequirement(constraint), severity };
+  }
+  // legacy v1 lock {type, name, value}
+  const name = constraint.name ?? constraint.label ?? constraint.title ?? constraint.type ?? 'requirement';
+  const value = constraint.value ?? constraint.expected ?? constraint.description;
+  return { label: value != null && value !== '' ? `${name}: ${value}` : String(name), severity };
 }
 
 function renderConstraints() {
   const container = $('constraints'); container.replaceChildren();
   const entries = constraintEntries(state.run);
-  if (!entries.length) return appendEmpty(container, 'No constraints were persisted.');
+  if (!entries.length) return appendEmpty(container, 'No requirements were persisted.');
   for (const constraint of entries) {
-    const status = constraint.status ?? (constraint.violated ? 'violated' : constraint.preserved === true ? 'preserved' : 'unverifiable');
-    const item = document.createElement('div'); item.className = `constraint ${statusClass(status) === 'failed' ? 'violated' : statusClass(status) === 'complete' ? 'preserved' : ''}`;
+    const info = describeConstraint(constraint);
+    const status = constraint.status ?? (constraint.violated ? 'violated' : constraint.preserved === true ? 'preserved' : null);
+    const item = document.createElement('div'); item.className = `constraint ${status && statusClass(status) === 'failed' ? 'violated' : status && statusClass(status) === 'complete' ? 'preserved' : ''}`;
     const body = document.createElement('div');
-    const strong = document.createElement('strong'); strong.textContent = text(constraint.name ?? constraint.title ?? constraint.constraint);
-    const small = document.createElement('small'); small.textContent = text(constraint.value ?? constraint.expected ?? constraint.description, 'Value unavailable');
+    const strong = document.createElement('strong'); strong.textContent = info.label;
+    const small = document.createElement('small'); small.textContent = String(info.severity).replaceAll('_', ' ');
     body.append(strong, small);
-    const badge = document.createElement('span'); badge.className = `status-label ${statusClass(status)}`; badge.textContent = text(status);
+    const badge = document.createElement('span'); badge.className = `status-label ${status ? statusClass(status) : (info.severity === 'hard_lock' || info.severity === 'forbidden') ? 'failed' : 'neutral'}`;
+    badge.textContent = status ? text(status) : String(info.severity).replaceAll('_', ' ');
     item.append(body, badge); container.appendChild(item);
   }
 }
@@ -616,48 +634,55 @@ function renderModelPicker() {
   }
 }
 
-function addLockRow(lock = {}) {
-  const row = document.createElement('div'); row.className = 'lock-row';
-  const type = document.createElement('select'); type.className = 'field';
-  for (const [value, label] of [['module', 'Module'], ['parameter', 'Parameter'], ['literal', 'Required text']]) type.appendChild(new Option(label, value));
-  type.value = lock.type ?? 'module';
-  const name = document.createElement('input'); name.className = 'field'; name.placeholder = 'Name / label'; name.value = lock.name ?? '';
-  const value = document.createElement('input'); value.className = 'field'; value.placeholder = 'Required value (optional)'; value.value = lock.value ?? '';
-  const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'mini-button'; remove.textContent = '×'; remove.title = 'Remove requirement';
-  remove.onclick = () => { row.remove(); syncAdvancedLocks(); validateRunForm(); };
-  for (const input of [type, name, value]) input.addEventListener('input', () => { syncAdvancedLocks(); validateRunForm(); });
-  row.append(type, name, value, remove); $('lock-editor').appendChild(row);
-  syncAdvancedLocks();
+function setJsonModeUI(on) {
+  $('req-json-wrap').hidden = !on;
+  $('req-editor').hidden = on;
+  $('req-add').disabled = on; $('req-preset').disabled = on; $('req-extract-btn').disabled = on;
 }
 
-function loadStructuredLocks(locks) {
-  $('lock-editor').replaceChildren();
-  for (const lock of locks.length ? locks : [{}]) addLockRow(lock);
+function ensureBuilder() {
+  if (state.builder) return state.builder;
+  const preset = $('req-preset'); preset.replaceChildren();
+  for (const [value, label] of PRESET_LABELS) preset.appendChild(new Option(label, value));
+  state.builder = new RequirementsBuilder({
+    root: $('req-editor'), jsonEl: $('req-json'), errorEl: $('req-error'),
+    summaryEl: $('req-summary'), extractEl: $('req-extract'),
+    getProfiles: () => state.profiles, getSpec: () => $('new-spec').value,
+    onChange: validateRunForm,
+  });
+  preset.addEventListener('change', () => { if (preset.value) { state.builder.applyPreset(preset.value); preset.value = ''; } });
+  $('req-add').addEventListener('click', () => { state.builder.addRow(); state.builder.sync(); });
+  $('req-extract-btn').addEventListener('click', () => state.builder.runExtract());
+  $('req-advanced').addEventListener('change', event => {
+    state.builder.setJsonMode(event.target.checked);
+    setJsonModeUI(event.target.checked);
+    validateRunForm();
+  });
+  $('req-json').addEventListener('input', () => { if ($('req-advanced').checked) validateRunForm(); });
+  $('req-json-copy').addEventListener('click', () => navigator.clipboard?.writeText($('req-json').value));
+  $('req-json-export').addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(state.builder.getRequirements(), null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'locked-requirements.json';
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+  $('req-json-import').addEventListener('click', () => $('req-json-file').click());
+  $('req-json-file').addEventListener('change', async event => {
+    const file = event.target.files[0]; if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (!Array.isArray(parsed)) throw new Error('requirements JSON must be an array');
+      $('req-advanced').checked = false; setJsonModeUI(false); state.builder.jsonMode = false;
+      state.builder.setRequirements(parsed); $('req-error').textContent = '';
+    } catch (error) { $('req-error').textContent = 'Import failed: ' + error.message; }
+    event.target.value = '';
+  });
+  $('req-json-reset').addEventListener('click', () => {
+    $('req-advanced').checked = false; state.builder.setJsonMode(false); setJsonModeUI(false); validateRunForm();
+  });
+  return state.builder;
 }
 
-function structuredLocks() {
-  return [...$('lock-editor').querySelectorAll('.lock-row')].map(row => {
-    const [type, name, value] = row.querySelectorAll('select,input');
-    const item = { type: type.value, name: name.value.trim() };
-    if (value.value.trim()) item.value = value.value.trim();
-    return item;
-  }).filter(item => item.name || item.value);
-}
-
-function syncAdvancedLocks() {
-  if (!$('advanced-locks').checked) $('new-locks').value = JSON.stringify(structuredLocks(), null, 2);
-}
-
-function collectLocks() {
-  const locks = $('advanced-locks').checked ? JSON.parse($('new-locks').value || '[]') : structuredLocks();
-  if (!Array.isArray(locks)) throw new Error('Locked requirements JSON must be an array.');
-  for (const lock of locks) {
-    if (!lock || typeof lock !== 'object' || !['module', 'parameter', 'literal'].includes(lock.type)) throw new Error('Each locked requirement needs a valid type.');
-    if (lock.type !== 'literal' && !String(lock.name ?? '').trim()) throw new Error('Module and parameter requirements need a name.');
-    if (lock.type === 'literal' && !String(lock.value ?? '').trim()) throw new Error('Required text needs a value.');
-  }
-  return locks;
-}
+function collectLocks() { return ensureBuilder().getRequirements(); }
 
 function selectedProfile() {
   return state.profiles.find(profile => profile.name === $('new-profile').value) ?? null;
@@ -667,7 +692,13 @@ function validateRunForm() {
   const mode = selectedRunMode();
   $('starting-model-section').hidden = mode !== 'evolve_existing';
   let locksOk = true;
-  try { collectLocks(); $('locks-error').textContent = ''; } catch (error) { locksOk = false; $('locks-error').textContent = error.message; }
+  if (state.builder) {
+    if ($('req-advanced').checked) {
+      try { const parsed = JSON.parse($('req-json').value || '[]'); if (!Array.isArray(parsed)) throw new Error('Requirements JSON must be an array.'); $('req-error').textContent = ''; }
+      catch (error) { locksOk = false; $('req-error').textContent = 'Advanced JSON invalid: ' + error.message; }
+    }
+    if (locksOk) locksOk = state.builder.validate().valid;
+  }
   const iterations = finite($('limit-iterations').value);
   const runtime = finite($('limit-runtime').value);
   const failures = finite($('limit-failures').value);
@@ -703,6 +734,11 @@ async function prepareRunDialog() {
     const select = $('new-profile'); select.replaceChildren(new Option('Select printer profile…', ''));
     for (const profile of state.profiles) select.appendChild(new Option(profile.name, profile.name, false, profile.name === profiles.default));
     if (!select.value && profiles.default) select.value = profiles.default;
+    ensureBuilder();
+    $('req-advanced').checked = false; setJsonModeUI(false); state.builder.jsonMode = false;
+    $('req-error').textContent = ''; $('req-extract').hidden = true;
+    const draft = state.builder.loadDraft();
+    state.builder.setRequirements(Array.isArray(draft) ? draft : []);
     renderModelPicker(); validateRunForm();
   } catch (error) { $('model-picker-error').textContent = `Could not load Library models: ${error.message}`; validateRunForm(); }
 }
@@ -718,16 +754,7 @@ function setupControls() {
   $('paste-id-toggle').addEventListener('change', event => { $('paste-id-row').hidden = !event.target.checked; });
   $('validate-pasted-id').addEventListener('click', validatePastedModel);
   $('new-source-id').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); validatePastedModel(); } });
-  $('add-lock').addEventListener('click', () => { addLockRow(); validateRunForm(); });
-  $('advanced-locks').addEventListener('change', event => {
-    if (!event.target.checked) {
-      try { loadStructuredLocks(JSON.parse($('new-locks').value || '[]')); $('locks-error').textContent = ''; }
-      catch (error) { event.target.checked = true; $('locks-error').textContent = error.message; }
-    }
-    $('lock-editor').hidden = event.target.checked; $('add-lock').hidden = event.target.checked; $('new-locks').hidden = !event.target.checked;
-    validateRunForm();
-  });
-  for (const id of ['new-spec', 'new-profile', 'new-locks', 'limit-iterations', 'limit-runtime', 'limit-failures', 'limit-no-improvement', 'limit-target']) $(id).addEventListener('input', validateRunForm);
+  for (const id of ['new-spec', 'new-profile', 'limit-iterations', 'limit-runtime', 'limit-failures', 'limit-no-improvement', 'limit-target']) $(id).addEventListener('input', validateRunForm);
   $('new-run-form').addEventListener('submit', async event => {
     event.preventDefault(); if (!validateRunForm()) return; setConnection('Validating and creating isolated run…');
     try {
@@ -756,6 +783,7 @@ function setupControls() {
           mutation_strength: 0.25, exploration_rate: 0.15,
         },
       });
+      state.builder?.clearDraft();
       $('new-run-dialog').close(); await initialize(); await loadRun(runId(created));
     } catch (error) { setConnection(`Run creation failed: ${error.message}`, 'error'); }
   });
@@ -835,4 +863,4 @@ function dispose() {
   state.viewers.forEach(viewer => viewer?.dispose());
 }
 
-setupViewers(); setupControls(); addLockRow(); validateRunForm(); initialize();
+setupViewers(); setupControls(); validateRunForm(); initialize();
