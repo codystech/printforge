@@ -63,7 +63,12 @@ async def training_lab_only_guard(request, call_next):
             status_code=403,
             content={"detail": "production mutations are disabled on the Training Lab test service"},
         )
-    return await call_next(request)
+    response = await call_next(request)
+    if EVOLUTION_LAB_CONFIG.lab_only:
+        # Lab-only: no Cache-Control on StaticFiles means browsers heuristically cache the
+        # JS/CSS and never see UI redeploys. Force revalidation (etag → cheap 304 when unchanged).
+        response.headers.setdefault("Cache-Control", "no-cache")
+    return response
 
 # name = 12.5; // [10:100] or [10:5:100]  → slider
 # name = "text"; // free text             → text input
