@@ -177,7 +177,8 @@ export class CandidateViewer {
   }
 
   load(assets, options = {}) {
-    this.pending = { assets: Array.isArray(assets) ? assets : assets ? [assets] : [], options };
+    const list = Array.isArray(assets) ? assets : assets ? [assets] : [];
+    this.pending = { assets: list, options };
     if (this.initialized && this.visible) this.consumePending();
   }
 
@@ -186,12 +187,24 @@ export class CandidateViewer {
     if (this.initialized && this.visible) this.consumePending();
   }
 
+  // Single-flight, latest-wins loader. Concurrent load() calls only queue this.pending; one runner
+  // drains to the newest request. This replaced a Symbol-token scheme where a superseded run bailed
+  // silently at a token check and left the pane stuck on "Loading persisted geometry…" forever.
   async consumePending() {
-    const request = this.pending;
-    if (!request || !this.initialized) return;
-    this.pending = null;
-    const token = Symbol('load');
-    this.loadToken = token;
+    if (this._loading || !this.initialized) return;
+    this._loading = true;
+    try {
+      while (this.pending) {
+        const request = this.pending;
+        this.pending = null;
+        await this.renderRequest(request);
+      }
+    } finally {
+      this._loading = false;
+    }
+  }
+
+  async renderRequest(request) {
     this.clearModels();
     this.setMessage('Loading persisted geometry…');
     if (request.options.bed) this.drawBed(request.options.bed);
@@ -201,8 +214,10 @@ export class CandidateViewer {
       this.setIssues(request.options.issues ?? []);
       this.setMessage('');
       this.addBadge('DEMO PROCEDURAL PREVIEW · NOT GENERATED GEOMETRY');
+      this.invalidate();
       return;
     }
+    if (!request.assets.length) { this.setMessage('No persisted geometry yet'); this.invalidate(); return; }
     try {
       const loaded = [];
       for (const asset of request.assets) {
@@ -211,7 +226,7 @@ export class CandidateViewer {
         const response = await fetch(url, { cache: 'force-cache' });
         if (!response.ok) throw new Error(`preview ${response.status}`);
         const geometry = this.loader.parse(await response.arrayBuffer());
-        if (this.loadToken !== token) { geometry.dispose(); return; }
+        if (this.pending) { geometry.dispose(); return; } // newer request queued — drain loop renders it
         geometry.computeVertexNormals();
         const role = asset?.role ?? 'printable';
         const material = new THREE.MeshStandardMaterial({ color: roleColor(role), roughness: .52, metalness: .06, transparent: role !== 'printable' && role !== 'assembly', opacity: role === 'negative' ? .24 : role === 'reference' || role === 'fit_cutout' ? .46 : 1 });
@@ -228,7 +243,7 @@ export class CandidateViewer {
       this.setMessage('');
       this.addBadge(`${loaded.length} persisted asset${loaded.length === 1 ? '' : 's'}`);
     } catch (error) {
-      if (this.loadToken === token) this.setMessage(`Preview unavailable — ${error.message}`);
+      this.setMessage(`Preview unavailable — ${error.message}`);
     }
     this.invalidate();
   }
@@ -281,7 +296,6 @@ export class CandidateViewer {
 
   clearModels() {
     if (!this.initialized) return;
-    this.loadToken = null;
     for (const child of [...this.modelGroup.children]) this.disposeObject(child);
     for (const child of [...this.markerGroup.children]) this.disposeObject(child);
     this.container.querySelector('.viewer-badge')?.remove();

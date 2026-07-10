@@ -269,9 +269,15 @@ function candidateArtifacts(candidate) {
 }
 
 async function resolveArtifacts(candidate) {
-  const local = candidateArtifacts(candidate);
-  if (local.length) return local;
   const id = candidateId(candidate);
+  const local = candidateArtifacts(candidate);
+  if (local.length) {
+    // Embedded artifacts carry {name,size,sha256} but no URL; synthesize the fetch URL from the
+    // candidate id + name so the viewer can actually load them (otherwise assetUrl() is null and
+    // the pane sticks on "Loading persisted geometry…").
+    return id ? local.map(a => (typeof a === 'string' || a?.url || a?.preview_url || a?.stl_url || a?.download_url || a?.stl_id) ? a
+      : { ...a, url: `/training-lab/api/candidates/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(a.name ?? '')}` }) : local;
+  }
   if (!id) return [];
   try {
     const response = await api(`/training-lab/api/candidates/${encodeURIComponent(id)}/artifacts`);
