@@ -219,13 +219,15 @@ def create_router(
         db, _ = require_lab()
         if adapters.promote_exemplar is None:
             raise HTTPException(501, "promotion to production is not wired on this deployment")
+        run = db.get_run(run_id)
+        if run.get("current_best_candidate_id") != candidate_id:
+            raise HTTPException(409, "only the run's current winning candidate can be promoted")
         if not record.get("required_checks_passed"):
-            raise HTTPException(409, "candidate has not passed required checks; not eligible for promotion")
+            raise HTTPException(409, "winning candidate has not passed required checks; not eligible for promotion")
         try:
             scad = store.candidate_artifact(run_id, candidate_id, "model.scad").read_text()  # type: ignore[union-attr]
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(404, "candidate has no model.scad to promote") from exc
-        run = db.get_run(run_id)
         spec = run.get("validated_spec") or run.get("source_prompt") or "evolution lab exemplar"
         score = record.get("score", {}).get("total") if isinstance(record.get("score"), dict) else record.get("score")
         model_id = adapters.promote_exemplar(scad, run.get("title") or spec, spec, score, candidate_id)

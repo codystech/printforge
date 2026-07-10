@@ -26,7 +26,11 @@ def main() -> None:
     # --- Bridge B: winner -> library exemplar picked up by the taste-loop ---
     scad = "// tag\ncube([10,10,10]);\n"
     mid = app.promote_exemplar_to_library(scad, "a desk phone stand", "a desk phone stand", 66, "cand_1")
+    duplicate = app.promote_exemplar_to_library(scad, "duplicate request", "duplicate request", 99, "cand_1")
     meta = app.json.loads((tmp / mid / "meta.json").read_text())
+    assert duplicate == mid, "promotion retries must return the existing exemplar ID"
+    assert len([path for path in tmp.iterdir() if (path / "meta.json").exists()]) == 1, \
+        "promotion retries must not create duplicate exemplars"
     assert meta["rating"] == 1, "promoted exemplar must be a thumbs-up"
     assert meta["source"] == "evolution-lab" and meta["source_candidate_id"] == "cand_1"
 

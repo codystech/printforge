@@ -16,6 +16,8 @@ from typing import Any, Callable, Iterable
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+MUTATION_OUTCOME_MANIFEST = "recent.json"
+MUTATION_OUTCOME_WINDOW = 1000
 
 
 def safe_id(value: str, label: str = "id") -> str:
@@ -57,6 +59,7 @@ class EvolutionStore:
             self.root / "benchmarks",
             self.root / "proposals",
             self.root / "datasets",
+            self.root / "mutation_outcomes",
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -360,7 +363,15 @@ class EvolutionStore:
         return out
 
     def _collection_dir(self, collection: str) -> Path:
-        allowed = {"memory", "physical", "calibrations", "benchmarks", "proposals", "datasets"}
+        allowed = {
+            "memory",
+            "physical",
+            "calibrations",
+            "benchmarks",
+            "proposals",
+            "datasets",
+            "mutation_outcomes",
+        }
         if collection not in allowed:
             raise ValueError("invalid collection")
         return self.root / collection
@@ -390,13 +401,109 @@ class EvolutionStore:
             return record
 
     def list_records(self, collection: str) -> list[dict]:
+        def created_at(record: dict) -> float:
+            try:
+                value = float(record.get("created_at", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+            return value if value == value else 0
+
         out = []
         for path in self._collection_dir(collection).glob("*.json"):
             try:
-                out.append(self.read_json(path))
+                record = self.read_json(path)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-        return sorted(out, key=lambda item: item.get("created_at", 0), reverse=True)
+            if isinstance(record, dict):
+                out.append(record)
+        records = sorted(out, key=created_at, reverse=True)
+        return records
+
+    @staticmethod
+    def _mutation_outcome_id(outcome: dict) -> str:
+        identity = "\0".join((
+            str(outcome.get("run_id") or ""),
+            str(outcome.get("generation") if outcome.get("generation") is not None else ""),
+            str(outcome.get("candidate_id") or ""),
+        ))
+        return f"mutation_outcome_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+
+    def _mutation_manifest_ids(self) -> list[str]:
+        path = self.root / "mutation_outcomes" / MUTATION_OUTCOME_MANIFEST
+        try:
+            manifest = self.read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("ids"), list):
+            return []
+        ids = []
+        for value in manifest["ids"][:MUTATION_OUTCOME_WINDOW]:
+            if isinstance(value, str) and ID_RE.fullmatch(value):
+                ids.append(value)
+        return ids
+
+    def _write_mutation_manifest(self, ids: list[str]) -> None:
+        path = self.root / "mutation_outcomes" / MUTATION_OUTCOME_MANIFEST
+        self.write_json(path, {
+            "version": 1,
+            "ids": ids[:MUTATION_OUTCOME_WINDOW],
+            "updated_at": utc_ts(),
+        })
+
+    def create_mutation_outcome(self, outcome: dict) -> dict:
+        """Persist one immutable, retry-idempotent lab-only mutation result."""
+
+        outcome = dict(outcome)
+        rid = self._mutation_outcome_id(outcome)
+        outcome["id"] = rid
+        outcome.setdefault("created_at", utc_ts())
+        outcome.setdefault("updated_at", outcome["created_at"])
+        path = self.root / "mutation_outcomes" / f"{rid}.json"
+        with self._lock:
+            if path.exists():
+                existing = self.read_json(path)
+                if not isinstance(existing, dict):
+                    raise ValueError("existing mutation outcome is malformed")
+                identity = ("run_id", "candidate_id", "generation")
+                if any(existing.get(key) != outcome.get(key) for key in identity):
+                    raise ValueError("deterministic mutation outcome ID collision")
+                persisted = existing
+            else:
+                self.write_json(path, outcome, exclusive=True)
+                persisted = outcome
+            ids = [rid] + [item for item in self._mutation_manifest_ids() if item != rid]
+            self._write_mutation_manifest(ids)
+            return persisted
+
+    def list_mutation_outcomes(
+        self,
+        adaptive_scope: dict | None = None,
+        *,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Return a manifest-bounded recent window of lab-only mutation results.
+
+        Passing a scope uses exact matching and intentionally excludes legacy
+        unscoped rows. Stale, corrupt, or malformed manifest entries fail closed;
+        this path never scans the lifetime outcome directory.
+        """
+
+        bounded_limit = min(max(int(limit), 0), 1000)
+        records = []
+        for rid in self._mutation_manifest_ids():
+            path = self.root / "mutation_outcomes" / f"{rid}.json"
+            try:
+                record = self.read_json(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("id") != rid:
+                continue
+            if adaptive_scope is not None and record.get("adaptive_scope") != adaptive_scope:
+                continue
+            records.append(record)
+            if len(records) >= bounded_limit:
+                break
+        return records
 
     def write_dataset_file(self, export_id: str, name: str, content: bytes) -> Path:
         safe_id(export_id, "export id")

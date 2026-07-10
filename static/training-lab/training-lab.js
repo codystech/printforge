@@ -32,6 +32,11 @@ const present = value => value !== undefined && value !== null && value !== '';
 const text = (value, fallback = 'Unavailable') => present(value) ? String(value) : fallback;
 const collection = value => Array.isArray(value) ? value : value && typeof value === 'object' ? Object.values(value) : [];
 const candidateId = candidate => candidate?.candidate_id ?? candidate?.id ?? null;
+const isCurrentBest = candidate => candidateId(candidate) === state.run?.current_best_candidate_id;
+const isPromotedExemplar = candidate => state.libraryModels.some(model =>
+  model?.source === 'evolution-lab' && model?.source_candidate_id === candidateId(candidate));
+const canPromoteExemplar = candidate => isCurrentBest(candidate)
+  && candidate?.required_checks_passed === true && !isPromotedExemplar(candidate);
 const generation = candidate => finite(candidate?.generation_number ?? candidate?.generation) ?? 0;
 const totalScore = candidate => finite(candidate?.reward_score ?? candidate?.total_score ?? candidate?.score?.total ?? (typeof candidate?.score === 'number' ? candidate.score : null));
 const selection = candidate => String(candidate?.selection_status ?? candidate?.winner_status ?? candidate?.status ?? '').toLowerCase();
@@ -484,7 +489,7 @@ function showCandidate(candidate) {
   const add = (label, handler, danger = false) => {
     const button = document.createElement('button'); button.type = 'button';
     button.className = `button ${danger ? 'danger' : 'secondary'}`; button.textContent = label;
-    button.onclick = handler; actions.appendChild(button);
+    button.onclick = handler; actions.appendChild(button); return button;
   };
   add('Compare with parent', () => {
     state.manualPair = [candidate.parent_candidate_id, candidateId(candidate)];
@@ -498,17 +503,36 @@ function showCandidate(candidate) {
     try { const created = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/branch`); $('evidence-dialog').close(); await initialize(); await loadRun(runId(created)); }
     catch (error) { setConnection(`Branch failed: ${error.message}`, 'error'); }
   });
-  if (candidate.required_checks_passed) {
-    add('Promote → production library', async () => {
-      try { const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/promote-exemplar`);
-            setConnection(`Promoted to production library as ${r.library_model_id} (thumbs-up few-shot)`, 'ok'); }
-      catch (error) { setConnection(`Promote failed: ${error.message}`, 'error'); }
+  const promoted = isPromotedExemplar(candidate);
+  const revokePromoted = async event => {
+    const button = event?.currentTarget;
+    if (button) button.disabled = true;
+    try {
+      const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/revoke-exemplar`);
+      state.libraryModels = state.libraryModels.filter(model => model?.source_candidate_id !== candidateId(candidate));
+      if (button) { button.textContent = 'Removed from production'; button.onclick = null; }
+      setConnection(`Removed ${r.revoked} promoted exemplar(s) from production`, 'ok');
+    } catch (error) {
+      if (button) button.disabled = false;
+      setConnection(`Revoke failed: ${error.message}`, 'error');
+    }
+  };
+  if (canPromoteExemplar(candidate)) {
+    add('Promote → production library', async event => {
+      const button = event.currentTarget; button.disabled = true;
+      try {
+        const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/promote-exemplar`);
+        state.libraryModels.push({ id: r.library_model_id, source: 'evolution-lab', source_candidate_id: candidateId(candidate) });
+        button.textContent = 'Remove from production'; button.onclick = revokePromoted; button.disabled = false;
+        setConnection(`Promoted to production library as ${r.library_model_id} (thumbs-up few-shot)`, 'ok');
+      } catch (error) {
+        button.disabled = false;
+        setConnection(`Promote failed: ${error.message}`, 'error');
+      }
     });
-    add('Remove from production', async () => {
-      try { const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/revoke-exemplar`);
-            setConnection(`Removed ${r.revoked} promoted exemplar(s) from production`, 'ok'); }
-      catch (error) { setConnection(`Revoke failed: ${error.message}`, 'error'); }
-    });
+  }
+  if (promoted) {
+    add('Remove from production', revokePromoted);
   }
   add('Delete candidate', async () => {
     if (!confirm('Delete this isolated candidate and its artifacts? Protected or parent candidates cannot be deleted.')) return;
@@ -887,6 +911,8 @@ async function initialize() {
     state.bootstrap = await api('/training-lab/api/bootstrap');
     fillRunSelect(); populateHeader();
     if (!labEnabled(state.bootstrap)) { renderDisabled(state.bootstrap); setConnection('Training Lab disabled'); return; }
+    try { state.libraryModels = collection(await api('/models')); }
+    catch { state.libraryModels = []; }
     const params = new URLSearchParams(location.search);
     const requested = params.get('run');
     const active = runId(state.bootstrap.active_run) ?? state.bootstrap.active_run_id;

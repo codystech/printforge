@@ -8,14 +8,22 @@ OpenSCAD, a model provider, or the production model library.
 from __future__ import annotations
 
 import asyncio
+import random
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from evolution_lab.benchmarks import benchmark_catalog
+from evolution_lab.adaptive import (
+    MUTATION_CATALOG,
+    adaptive_history_scope,
+    mutation_weights,
+    select_mutations,
+)
 from evolution_lab.config import EvolutionLabConfig
 from evolution_lab.demo import DEMO_BANNER, DEMO_RUN_ID
 from evolution_lab.engine import EvolutionAdapters, EvolutionEngine
@@ -67,6 +75,7 @@ class FakeEvolutionBackend:
         stop_on_first_generation_call: bool = False,
         fail_generation: bool = False,
         block_generation: bool = False,
+        block_generation_labels: set[str] | None = None,
     ) -> None:
         self.baseline_score = baseline_score
         self.candidate_scores = candidate_scores
@@ -74,6 +83,7 @@ class FakeEvolutionBackend:
         self.stop_on_first_generation_call = stop_on_first_generation_call
         self.fail_generation = fail_generation
         self.block_generation = block_generation
+        self.block_generation_labels = block_generation_labels or set()
         self.engine: EvolutionEngine | None = None
         self.generation_contexts: list[dict[str, Any]] = []
 
@@ -102,11 +112,11 @@ class FakeEvolutionBackend:
         if self.stop_on_first_generation_call and len(self.generation_contexts) == 1:
             assert self.engine is not None
             self.engine.stop_after_generation(context["run"]["run_id"])
-        if self.block_generation:
+        label = context["variant_label"]
+        if self.block_generation or label in self.block_generation_labels:
             await asyncio.sleep(60)
         if self.fail_generation:
             raise RuntimeError("deterministic fake generation failure")
-        label = context["variant_label"]
         return {
             "scad": f"{parent_scad}\n// fake variant {label}\n",
             "backend": "unit-test/fake",
@@ -413,14 +423,96 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
                 store.candidate_artifact(run_id, candidate["candidate_id"], "model.scad").is_file()
             )
 
+    async def test_mutation_outcomes_persist_and_feed_later_run_selection(self) -> None:
+        fake = FakeEvolutionBackend(
+            baseline_score=60,
+            candidate_scores={"A": 90, "B": 80},
+        )
+        engine, store = self.make_engine(fake)
+        first_request = self.run_request()
+        first_request["initial_mutations"] = [dict(MUTATION_CATALOG[2]), dict(MUTATION_CATALOG[0])]
+        first = await engine.create_run(first_request)
+
+        await engine._generation(first["run_id"], 1)
+
+        snapshot = engine.snapshot(first["run_id"])
+        variants = [candidate for candidate in snapshot["candidates"] if candidate["generation"] == 1]
+        outcomes = store.list_mutation_outcomes(first["adaptive_history_scope"])
+        by_candidate = {item["candidate_id"]: item for item in outcomes}
+        self.assertEqual(set(by_candidate), {candidate["candidate_id"] for candidate in variants})
+        for candidate in variants:
+            outcome = by_candidate[candidate["candidate_id"]]
+            self.assertEqual(outcome["run_id"], first["run_id"])
+            self.assertEqual(outcome["generation"], 1)
+            self.assertEqual(outcome["mutation_type"], candidate["mutation"]["mutation_type"])
+            self.assertEqual(outcome["score_delta"], candidate["score"]["total"] - 60)
+            self.assertEqual(outcome["success"], candidate["selection_status"] == "winner")
+            self.assertEqual(outcome["selection_status"], candidate["selection_status"])
+            self.assertTrue(outcome["eligible"])
+            self.assertEqual(outcome["adaptive_scope"], first["adaptive_history_scope"])
+
+        learned_weights = mutation_weights(outcomes)
+        neutral_weights = mutation_weights([])
+        self.assertGreater(learned_weights["wall_thickness"], neutral_weights["wall_thickness"])
+        learned_counts = 0
+        neutral_counts = 0
+        for seed in range(500):
+            if select_mutations(outcomes, n=1, exploration_rate=0, rng=random.Random(seed))[0]["mutation_type"] == "wall_thickness":
+                learned_counts += 1
+            if select_mutations([], n=1, exploration_rate=0, rng=random.Random(seed))[0]["mutation_type"] == "wall_thickness":
+                neutral_counts += 1
+        self.assertGreater(learned_counts, neutral_counts)
+
+        reopened = EvolutionStore(store.root)
+        self.assertEqual(
+            {item["candidate_id"] for item in reopened.list_mutation_outcomes(first["adaptive_history_scope"])},
+            set(by_candidate),
+        )
+        self.assertEqual(snapshot["next_mutation_generation"], 2)
+        self.assertEqual(len(snapshot["next_mutation_proposals"]), 2)
+
+        second_request = self.run_request()
+        second_request["initial_mutations"] = []
+        second_request["limits"]["random_seed"] = 17
+        second = await engine.create_run(second_request)
+        second_run = store.get_run(second["run_id"])
+        with patch("evolution_lab.engine.select_mutations", wraps=select_mutations) as selector:
+            selected = engine._mutations(second_run, 1)
+
+        history = selector.call_args.args[0]
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(any(item["run_id"] == first["run_id"] for item in history))
+        self.assertEqual(selector.call_args.kwargs["exploration_rate"], 0.15)
+
+        unrelated_request = self.run_request()
+        unrelated_request["initial_mutations"] = []
+        unrelated_request["printer_profile"] = {
+            **unrelated_request["printer_profile"], "name": "Unit Test Printer PETG", "material": "PETG",
+        }
+        unrelated_request["material_profile"] = {"material": "PETG", "layer_height": 0.2}
+        unrelated = await engine.create_run(unrelated_request)
+        with patch("evolution_lab.engine.select_mutations", wraps=select_mutations) as unrelated_selector:
+            engine._mutations(store.get_run(unrelated["run_id"]), 1)
+        self.assertEqual(unrelated_selector.call_args.args[0], [])
+
+        proposed = snapshot["next_mutation_proposals"]
+        fake.generation_contexts.clear()
+        await engine._generation(first["run_id"], 2)
+        self.assertEqual(
+            [context["mutation"] for context in fake.generation_contexts],
+            proposed,
+        )
+
     async def test_hard_lock_rejection_cannot_win_despite_higher_score(self) -> None:
         fake = FakeEvolutionBackend(
             baseline_score=50,
             candidate_scores={"A": 99, "B": 70},
             failure_codes={"A": ["broken_hard_lock"]},
         )
-        engine, _ = self.make_engine(fake)
-        created = await engine.create_run(self.run_request())
+        engine, store = self.make_engine(fake)
+        request = self.run_request()
+        request["initial_mutations"] = [dict(MUTATION_CATALOG[0]), dict(MUTATION_CATALOG[2])]
+        created = await engine.create_run(request)
         run_id = created["run_id"]
 
         await engine._generation(run_id, 1)
@@ -440,6 +532,88 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(winner["selection_status"], "winner")
         self.assertEqual(snapshot["current_best_candidate_id"], winner["candidate_id"])
         self.assertNotEqual(snapshot["current_best_candidate_id"], invalid["candidate_id"])
+
+        outcomes = store.list_mutation_outcomes(created["adaptive_history_scope"])
+        by_candidate = {item["candidate_id"]: item for item in outcomes}
+        rejected_outcome = by_candidate[invalid["candidate_id"]]
+        winner_outcome = by_candidate[winner["candidate_id"]]
+        self.assertEqual(rejected_outcome["score_delta"], 49)
+        self.assertFalse(rejected_outcome["eligible"])
+        self.assertFalse(rejected_outcome["success"])
+        self.assertEqual(rejected_outcome["selection_status"], "rejected")
+        self.assertTrue(winner_outcome["eligible"])
+        self.assertEqual(winner_outcome["selection_status"], "winner")
+        weights = mutation_weights(outcomes)
+        self.assertLess(weights["fit_clearance"], weights["wall_thickness"])
+
+    async def test_promotion_requires_current_checked_best_but_revoke_remains_independent(self) -> None:
+        fake = FakeEvolutionBackend(
+            baseline_score=50,
+            candidate_scores={"A": 90, "B": 70},
+        )
+        engine, store = self.make_engine(fake)
+        created = await engine.create_run(self.run_request())
+        await engine._generation(created["run_id"], 1)
+        variants = {
+            item["variant_label"]: item
+            for item in engine.snapshot(created["run_id"])["candidates"]
+            if item["generation"] == 1
+        }
+        promoted: list[str] = []
+        revoked: list[str] = []
+        adapters = fake.adapters()
+        adapters.promote_exemplar = lambda _scad, _name, _spec, _score, candidate_id: (
+            promoted.append(candidate_id) or "abc123def456"
+        )
+        adapters.revoke_exemplar = lambda candidate_id: revoked.append(candidate_id) or 1
+        router = create_router(
+            engine.config,
+            adapters,
+            store=store,
+            production_branch="main",
+        )
+        promote = route_endpoint(
+            router,
+            "/training-lab/api/candidates/{candidate_id}/promote-exemplar",
+            "POST",
+        )
+        revoke = route_endpoint(
+            router,
+            "/training-lab/api/candidates/{candidate_id}/revoke-exemplar",
+            "POST",
+        )
+
+        with self.assertRaises(HTTPException) as not_best:
+            await promote(variants["B"]["candidate_id"])
+        self.assertEqual(not_best.exception.status_code, 409)
+        self.assertIn("current winning candidate", not_best.exception.detail)
+
+        store.update_candidate(
+            created["run_id"],
+            variants["A"]["candidate_id"],
+            lambda row: row.update({"required_checks_passed": False}),
+        )
+        with self.assertRaises(HTTPException) as unchecked:
+            await promote(variants["A"]["candidate_id"])
+        self.assertEqual(unchecked.exception.status_code, 409)
+        self.assertIn("not passed required checks", unchecked.exception.detail)
+
+        store.update_candidate(
+            created["run_id"],
+            variants["A"]["candidate_id"],
+            lambda row: row.update({"required_checks_passed": True}),
+        )
+        result = await promote(variants["A"]["candidate_id"])
+        self.assertEqual(result["library_model_id"], "abc123def456")
+        self.assertEqual(promoted, [variants["A"]["candidate_id"]])
+
+        engine.restore_candidate(created["run_id"], variants["B"]["candidate_id"])
+        self.assertNotEqual(
+            engine.snapshot(created["run_id"])["current_best_candidate_id"],
+            variants["A"]["candidate_id"],
+        )
+        self.assertEqual(await revoke(variants["A"]["candidate_id"]), {"revoked": 1})
+        self.assertEqual(revoked, [variants["A"]["candidate_id"]])
 
     async def test_stop_request_finishes_both_variants_then_stops_before_next_generation(self) -> None:
         fake = FakeEvolutionBackend(
@@ -562,7 +736,7 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_immediate_cancellation_preserves_in_progress_candidate(self) -> None:
         fake = FakeEvolutionBackend(baseline_score=10, candidate_scores={"A": 20, "B": 15}, block_generation=True)
-        engine, _ = self.make_engine(fake)
+        engine, store = self.make_engine(fake)
         created = await engine.create_run(self.run_request())
         run_id = created["run_id"]
         engine.start(run_id)
@@ -579,6 +753,41 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
         cancelled = [item for item in snapshot["candidates"] if item["status"] == "cancelled"]
         self.assertEqual(len(cancelled), 1)
         self.assertEqual(cancelled[0]["failure_reasons"], ["user_cancelled"])
+        outcomes = store.list_mutation_outcomes(snapshot["adaptive_history_scope"])
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["selection_status"], "cancelled")
+        self.assertFalse(outcomes[0]["eligible"])
+        self.assertLessEqual(outcomes[0]["score_delta"], 0)
+
+    async def test_cancellation_records_completed_and_active_attempts_before_rethrow(self) -> None:
+        fake = FakeEvolutionBackend(
+            baseline_score=10,
+            candidate_scores={"A": 20, "B": 15},
+            block_generation_labels={"B"},
+        )
+        engine, store = self.make_engine(fake)
+        created = await engine.create_run(self.run_request())
+        engine.start(created["run_id"])
+        for _ in range(200):
+            active = engine.snapshot(created["run_id"]).get("active_candidate_id")
+            if active:
+                candidate = store.get_candidate(created["run_id"], active)
+                if candidate.get("variant_label") == "B":
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("variant B did not become active")
+
+        engine.cancel(created["run_id"])
+        await asyncio.wait_for(engine._tasks[created["run_id"]], timeout=2)
+        snapshot = engine.snapshot(created["run_id"])
+        outcomes = store.list_mutation_outcomes(snapshot["adaptive_history_scope"])
+        by_status = {item["selection_status"]: item for item in outcomes}
+
+        self.assertEqual(set(by_status), {"loser", "cancelled"})
+        self.assertTrue(by_status["loser"]["eligible"])
+        self.assertFalse(by_status["cancelled"]["eligible"])
+        self.assertLessEqual(by_status["cancelled"]["score_delta"], 0)
 
     async def test_candidate_restore_branch_and_guarded_delete_preserve_versions(self) -> None:
         fake = FakeEvolutionBackend(baseline_score=10, candidate_scores={"A": 90, "B": 80})
@@ -604,6 +813,33 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             engine.delete_candidate(run_id, loser["candidate_id"])
         self.assertTrue(store.candidate_artifact(run_id, loser["candidate_id"], "model.scad").is_file())
+
+    async def test_spec_created_branches_recompute_scope_without_cross_spec_bleed(self) -> None:
+        fake = FakeEvolutionBackend(baseline_score=60, candidate_scores={})
+        engine, _ = self.make_engine(fake)
+
+        async def create_branch(spec: str) -> dict:
+            request = self.run_request()
+            request.update({
+                "run_mode": "create_from_spec",
+                "source_model_id": None,
+                "validated_spec": spec,
+            })
+            created = await engine.create_run(request)
+            await engine._generation_zero(created["run_id"])
+            completed = engine.snapshot(created["run_id"])
+            return await engine.branch_candidate(
+                created["run_id"], completed["current_best_candidate_id"]
+            )
+
+        first = await create_branch("Make a fitted PLA phone stand")
+        second = await create_branch("Make a sealed PLA electronics box")
+
+        self.assertIsNone(first["source_model_id"])
+        self.assertEqual(first["adaptive_history_scope"], adaptive_history_scope(first))
+        self.assertEqual(second["adaptive_history_scope"], adaptive_history_scope(second))
+        self.assertEqual(first["adaptive_history_scope"]["design"]["kind"], "validated_spec")
+        self.assertNotEqual(first["adaptive_history_scope"], second["adaptive_history_scope"])
 
     async def test_runtime_limit_cancels_active_work_and_completes_with_reason(self) -> None:
         fake = FakeEvolutionBackend(baseline_score=10, candidate_scores={"A": 20, "B": 15}, block_generation=True)
@@ -654,6 +890,24 @@ class BenchmarkCatalogTests(unittest.TestCase):
                 self.assertGreaterEqual(item["minimum_acceptable_score"], 0)
                 self.assertLessEqual(item["minimum_acceptable_score"], 100)
                 self.assertIsNone(item["result"])
+
+
+class TrainingLabUiContractTests(unittest.TestCase):
+    def test_promotion_and_revoke_controls_use_independent_persisted_state(self) -> None:
+        source = (
+            Path(__file__).parents[1] / "static" / "training-lab" / "training-lab.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "candidateId(candidate) === state.run?.current_best_candidate_id",
+            source,
+        )
+        self.assertIn("candidate?.required_checks_passed === true", source)
+        self.assertIn("if (canPromoteExemplar(candidate))", source)
+        self.assertIn("if (promoted) {\n    add('Remove from production'", source)
+        self.assertIn("model?.source_candidate_id === candidateId(candidate)", source)
+        self.assertIn("button.disabled = true", source)
+        self.assertIn("button.textContent = 'Remove from production'", source)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .adaptive import adaptive_history_scope, outcome_record, select_mutations
 from .config import EvolutionLabConfig
 from .memory import MemoryService
 from .schemas import EvidenceLabel, ScoreCategory
@@ -150,7 +152,7 @@ class EvolutionEngine:
         run_id = new_id("run")
         now = utc_ts()
         limits = payload.get("limits") or {}
-        return {
+        record = {
             "run_id": run_id, "demo": False, "status": "created",
             "run_mode": mode, "source_model_id": source_model_id,
             "source_prompt": payload.get("source_prompt", ""),
@@ -170,6 +172,8 @@ class EvolutionEngine:
             "started_at": None, "created_at": now, "updated_at": now,
             "actual_training_performed": False,
         }
+        record["adaptive_history_scope"] = adaptive_history_scope(record)
+        return record
 
     async def _attach_baseline(self, run: dict, scad: str, meta: dict) -> dict:
         run_id = run["run_id"]
@@ -431,16 +435,19 @@ class EvolutionEngine:
             }))
             self.store.append_event(run_id, "info", "generation_zero_completed", "Generation zero generated, evaluated, and checkpointed", candidate_id=candidate_id, generation=0)
         except asyncio.CancelledError:
+            cancellation_reason = self.store.get_run(run_id).get("cancellation_reason") or "user_cancelled"
             if scad:
                 try:
                     self.store.add_candidate_artifacts(run_id, candidate_id, {"model.scad": scad})
                 except (FileExistsError, ValueError):
                     pass
-            self.store.update_candidate(run_id, candidate_id, lambda row: row.update({
-                "status": "cancelled", "selection_status": "rejected",
+            cancelled = self.store.update_candidate(run_id, candidate_id, lambda row: row.update({
+                "status": "cancelled", "selection_status": "cancelled",
                 "failure_reason": f"generation zero cancelled: {cancellation_reason}",
-                "failure_reasons": [cancellation_reason], "completed_at": utc_ts(),
+                "failure_reasons": [cancellation_reason], "required_checks_passed": False,
+                "completed_at": utc_ts(),
             }))
+            self._record_mutation_outcome(run, cancelled, 0, 0.0)
             raise
         except Exception as exc:
             if scad:
@@ -465,13 +472,77 @@ class EvolutionEngine:
             self.store.append_event(run_id, "error", "generation_zero_failed", f"Generation zero failed: {str(exc)[:500]}", candidate_id=candidate_id, generation=0)
             raise
 
+    def _select_mutations(self, run: dict, generation: int) -> list[dict]:
+        """Select two mutations while preserving explicit first-generation inputs."""
+
+        limits = run.get("limits") or {}
+        seed = limits.get("random_seed")
+        rng = random.Random(int(seed) + generation) if seed is not None else None
+        history_scope = run.get("adaptive_history_scope") or adaptive_history_scope(run)
+        selected = select_mutations(
+            self.store.list_mutation_outcomes(history_scope, limit=200),
+            n=2,
+            exploration_rate=limits.get("exploration_rate", 0.15),
+            rng=rng,
+        )
+        if generation != 1:
+            return selected
+
+        explicit = [dict(item) for item in run.get("initial_mutations", []) if isinstance(item, dict)]
+        if not explicit:
+            return selected
+        mutation_types = {item.get("mutation_type") for item in explicit}
+        explicit.extend(item for item in selected if item.get("mutation_type") not in mutation_types)
+        return explicit[:2]
+
     def _mutations(self, run: dict, generation: int) -> list[dict]:
-        seed = run.get("initial_mutations", []) if generation == 1 else run.get("next_mutation_proposals", [])
-        defaults = [
-            {"mutation_type": "fit_clearance", "parameter": "clearance", "original_value": None, "mutated_value": "+0.05mm", "expected_benefit": "reduce binding", "reason": "controlled fit exploration"},
-            {"mutation_type": "retention_geometry", "parameter": "retention", "original_value": None, "mutated_value": "alternate profile", "expected_benefit": "improve retention", "reason": "controlled functional exploration"},
-        ]
-        return (seed + defaults)[:2]
+        """Use the persisted proposal when present so the UI and executed run agree."""
+
+        proposals = run.get("next_mutation_proposals")
+        if run.get("next_mutation_generation") == generation and isinstance(proposals, list):
+            valid = [dict(item) for item in proposals if isinstance(item, dict)]
+            if len(valid) >= 2:
+                return valid[:2]
+        return self._select_mutations(run, generation)
+
+    def _record_mutation_outcome(
+        self,
+        run: dict,
+        candidate: dict,
+        generation: int,
+        parent_score: float,
+    ) -> dict:
+        """Persist one final candidate disposition without duplicating retries."""
+
+        score = candidate.get("score") if isinstance(candidate.get("score"), dict) else {}
+        hard_rejected = bool(score.get("hard_rejected"))
+        candidate_status = str(candidate.get("status") or "")
+        selection_status = str(candidate.get("selection_status") or "")
+        eligible = (
+            not hard_rejected
+            and candidate_status not in {"failed", "rejected", "cancelled"}
+            and selection_status in {"winner", "loser"}
+            and candidate.get("required_checks_passed") is True
+        )
+        try:
+            score_delta = float(score.get("total", 0) or 0) - float(parent_score)
+        except (TypeError, ValueError):
+            score_delta = -float(parent_score)
+        if selection_status == "cancelled":
+            score_delta = min(0.0, score_delta)
+        return self.store.create_mutation_outcome(outcome_record(
+            candidate.get("mutation") or {},
+            success=eligible and selection_status == "winner",
+            score_delta=score_delta,
+            run_id=run["run_id"],
+            candidate_id=candidate["candidate_id"],
+            generation=generation,
+            eligible=eligible,
+            hard_rejected=hard_rejected,
+            candidate_status=candidate_status,
+            selection_status=selection_status,
+            adaptive_scope=run.get("adaptive_history_scope") or adaptive_history_scope(run),
+        ))
 
     async def _generation(self, run_id: str, generation: int) -> None:
         run = self.store.get_run(run_id)
@@ -554,11 +625,22 @@ class EvolutionEngine:
                         self.store.add_candidate_artifacts(run_id, cid, {"model.scad": scad})
                     except (FileExistsError, ValueError):
                         pass
-                self.store.update_candidate(run_id, cid, lambda row: row.update({
-                    "status": "cancelled", "selection_status": "rejected",
+                cancelled = self.store.update_candidate(run_id, cid, lambda row: row.update({
+                    "status": "cancelled", "selection_status": "cancelled",
                     "failure_reason": f"generation cancelled: {cancellation_reason}",
-                    "failure_reasons": [cancellation_reason], "completed_at": utc_ts(),
+                    "failure_reasons": [cancellation_reason], "required_checks_passed": False,
+                    "completed_at": utc_ts(),
                 }))
+                parent_score = float(run.get("current_best_score", 0) or 0)
+                for completed in candidates:
+                    final_selection = "rejected" if completed.get("score", {}).get("hard_rejected") else "loser"
+                    completed = self.store.update_candidate(
+                        run_id,
+                        completed["candidate_id"],
+                        lambda row, status=final_selection: row.update({"selection_status": status}),
+                    )
+                    self._record_mutation_outcome(run, completed, generation, parent_score)
+                self._record_mutation_outcome(run, cancelled, generation, parent_score)
                 self.store.append_event(run_id, "warning", "candidate_cancelled", f"Variant {label} cancelled", candidate_id=cid, generation=generation)
                 raise
             except Exception as exc:
@@ -586,6 +668,11 @@ class EvolutionEngine:
         if winner_id:
             cp = self.store.create_checkpoint(run_id, winner_id, "current_best")
             checkpoint_id = cp["checkpoint_id"]
+        parent_score = float(run.get("current_best_score", 0) or 0)
+        for candidate in candidates:
+            finalized = self.store.get_candidate(run_id, candidate["candidate_id"])
+            self._record_mutation_outcome(run, finalized, generation, parent_score)
+
         def update(row: dict) -> None:
             row.setdefault("lineage_edges", []).extend({"parent": parent_id, "child": c["candidate_id"]} for c in candidates)
             row.setdefault("generation_results", []).append({"generation": generation, "candidate_ids": [c["candidate_id"] for c in candidates], **selection})
@@ -596,7 +683,8 @@ class EvolutionEngine:
                 row["current_best_checkpoint_id"] = checkpoint_id
                 winner = next(c for c in candidates if c["candidate_id"] == winner_id)
                 row["current_best_required_checks_passed"] = bool(winner.get("required_checks_passed"))
-            row["next_mutation_proposals"] = self._mutations(row, generation + 1)
+            row["next_mutation_proposals"] = self._select_mutations(row, generation + 1)
+            row["next_mutation_generation"] = generation + 1
             row["active_stage"] = None
             row["active_candidate_id"] = None
             generation_failed = all(c.get("status") == "failed" for c in candidates)
@@ -662,6 +750,7 @@ class EvolutionEngine:
             "source_candidate_id": candidate_id,
             "source_model_id": source_run.get("source_model_id"),
         })
+        branch["adaptive_history_scope"] = adaptive_history_scope(branch)
         snapshot = await self._attach_baseline(branch, scad, {
             "prompt": source_run.get("source_prompt", ""),
             "branched_from_run": run_id,

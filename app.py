@@ -604,6 +604,19 @@ def promoted_rules_block(prompt: str = "") -> str:
 def promote_exemplar_to_library(scad: str, name: str, prompt: str, score, candidate_id: str) -> str:
     """Promote a Training Lab winning candidate into the production library as a thumbs-up
     few-shot exemplar (consumed by _taste_example). Reversible: it is a normal rated model."""
+    for existing_dir in LIB_DIR.iterdir():
+        meta_file = existing_dir / "meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            existing = json.loads(meta_file.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            existing.get("source") == "evolution-lab"
+            and existing.get("source_candidate_id") == candidate_id
+        ):
+            return str(existing.get("id") or existing_dir.name)
     model_id = uuid.uuid4().hex[:12]
     mdir = LIB_DIR / model_id
     mdir.mkdir()
@@ -1918,7 +1931,7 @@ DESIGN SPECIFICATION (law):
 
 LOCKED REQUIREMENTS (must be present and satisfied; severity in brackets — HARD LOCK and FORBIDDEN are non-negotiable):
 {requirements_prompt_block(context.get('locked_constraints', []))}
-
+{promoted_rules_block(context.get('validated_spec', ''))}
 PRINTER PROFILE:
 {json.dumps(profile, indent=2)}
 
@@ -1949,7 +1962,7 @@ VALIDATED SPEC (law):
 
 LOCKED REQUIREMENTS (severity in brackets — HARD LOCK and FORBIDDEN must hold exactly):
 {requirements_prompt_block(context.get('locked_constraints', []))}
-
+{promoted_rules_block(context.get('validated_spec', ''))}
 CONTROLLED MUTATION:
 {json.dumps(mutation, indent=2)}
 

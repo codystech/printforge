@@ -82,6 +82,18 @@ straight to the Bambuddy archive.
 - Two controlled candidates share one baseline, specification, profile, locks,
   reference roles and export exclusions; evidence scoring selects a winner only
   when it beats the immutable current best
+- Each candidate's mutation outcome is retained in the isolated lab store;
+  later generations and runs safely balance exploring unused strategies with
+  favoring mutation types that previously won or improved the score. Failed,
+  cancelled, hard-rejected or otherwise ineligible attempts never receive
+  positive learning credit, even when their raw numeric score increased.
+- Adaptive reuse is exact-scope only: existing-model runs match the same source
+  model ID, while specification-created runs match a normalized-spec digest;
+  both also require the same profile name, printer, nozzle, layer height and
+  material. Legacy unscoped audit files remain untouched but do not influence
+  scoped selection. An atomically maintained recent-outcome manifest retains at
+  most 1,000 IDs; each selection reads only manifest-referenced files and uses at
+  most 200 matching outcomes, never a lifetime directory scan.
 - New runs can either select an existing Library model through a searchable
   name/thumbnail/ID/version/status picker or create generation zero directly
   from a design specification; legacy source-model requests remain compatible
@@ -94,7 +106,10 @@ straight to the Bambuddy archive.
   explicitly deleted; baselines and the current best are protected
 - Live run state reports iteration, stage, best score, latest failure and
   elapsed time. Immediate cancellation terminates the isolated lab Codex
-  process group and keeps the interrupted candidate for diagnosis
+  process group, keeps the interrupted candidate for diagnosis and records its
+  cancelled mutation outcome with no positive learning credit. Any candidate
+  completed earlier in that interrupted A/B generation is also retained as a
+  non-winning audited outcome.
 - Atomic filesystem state under gitignored `training_lab_data/` preserves runs,
   candidates, rejected variants, evidence, events, checkpoints, scoped memory,
   calibration/physical feedback, benchmark results and promotion proposals
