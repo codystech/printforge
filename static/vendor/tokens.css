@@ -1,0 +1,15 @@
+/* Vendored design tokens — Open Props naming, values tuned to PrintForge's existing
+   look so extracting inline styles causes zero visual shift.
+   ponytail: trimmed to the spacing/radii scales actually used; swap in the full
+   open-props/*.min.css if you ever want the complete scale. No --shadow-* tokens —
+   the UI has no shadows and adding them would be a redesign (out of scope this phase). */
+:root {
+  --size-1: 4px;
+  --size-2: 6px;
+  --size-3: 8px;
+  --size-4: 12px;
+  --size-5: 16px;
+  --radius-1: 4px;
+  --radius-2: 6px;
+  --radius-round: 999px;
+}

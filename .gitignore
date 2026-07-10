@@ -6,3 +6,4 @@ __pycache__/
 .env
 presets.txt
 profiles.json
+training_lab_data/

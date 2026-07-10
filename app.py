@@ -1,24 +1,29 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
+import signal
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
 import trimesh
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from parts import floating_starts, split_parts, write_3mf
 from prompts import SYSTEM_PROMPT, archetype_notes, qa_prompt, spec_prompt, user_prompt
+from evolution_lab import EvolutionAdapters, EvolutionLabConfig, create_router
 
 # "codex" shells out to the codex CLI (gpt-5.5, host only) and falls back to HTTP on failure
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "http")
@@ -38,8 +43,26 @@ LIB_DIR = Path(__file__).parent / "library"
 LIB_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR = Path(__file__).parent / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
+EVOLUTION_LAB_CONFIG = EvolutionLabConfig.from_env()
 
 app = FastAPI(title="PrintForge")
+
+
+@app.middleware("http")
+async def training_lab_only_guard(request, call_next):
+    """On the :8094 test service, allow writes only to isolated Training Lab APIs."""
+    if (EVOLUTION_LAB_CONFIG.lab_only
+            and request.method.upper() in {"GET", "HEAD"}
+            and request.url.path == "/"):
+        return RedirectResponse("/training-lab/", status_code=307)
+    if (EVOLUTION_LAB_CONFIG.lab_only
+            and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+            and not request.url.path.startswith("/training-lab/api/")):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "production mutations are disabled on the Training Lab test service"},
+        )
+    return await call_next(request)
 
 # name = 12.5; // [10:100] or [10:5:100]  → slider
 # name = "text"; // free text             → text input
@@ -704,6 +727,41 @@ PRINTABLES_GQL = "https://api.printables.com/graphql/"
 UA = {"User-Agent": "Mozilla/5.0 (PrintForge)"}
 
 
+def _guard_public_host(host: str):
+    """Reject hosts that resolve into private/loopback/link-local space — SSRF guard for
+    user-supplied import URLs. The box can otherwise reach the router, LAN services and the
+    cloud metadata endpoint. ponytail: getaddrinfo is blocking and this is a check-then-
+    connect TOCTOU (DNS rebinding could slip through); acceptable for a single-user LAN app,
+    upgrade to a pinned-IP connection if this ever faces untrusted callers."""
+    if not host:
+        raise HTTPException(400, "missing host in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise HTTPException(400, f"could not resolve host '{host}'")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+            raise HTTPException(400, f"refusing to fetch a non-public address ({ip})")
+
+
+async def _safe_get(client: httpx.AsyncClient, url: str, headers: dict) -> httpx.Response:
+    """GET that re-checks the host guard on EVERY redirect hop — a public URL that 302s to
+    169.254.169.254 is the classic SSRF bypass, so we follow redirects manually."""
+    for _ in range(6):  # initial + up to 5 redirects
+        u = httpx.URL(url)
+        if u.scheme not in ("http", "https"):
+            raise HTTPException(400, f"unsupported URL scheme '{u.scheme}'")
+        _guard_public_host(u.host or "")
+        r = await client.get(url, headers=headers)  # client default follow_redirects=False
+        if r.is_redirect and r.headers.get("location"):
+            url = urljoin(str(u), r.headers["location"])
+            continue
+        return r
+    raise HTTPException(400, "too many redirects")
+
+
 async def _printables_import(model_id: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
     q = f'query {{ print(id: "{model_id}") {{ name stls {{ id name fileSize }} }} }}'
     r = await client.post(PRINTABLES_GQL, headers=UA, json={"query": q})
@@ -717,7 +775,7 @@ async def _printables_import(model_id: str, client: httpx.AsyncClient) -> tuple[
     link = ((r.json().get("data") or {}).get("getDownloadLink") or {}).get("output", {}).get("link")
     if not link:
         raise HTTPException(502, "Printables did not return a download link")
-    dl = await client.get(link, headers=UA, follow_redirects=True)
+    dl = await _safe_get(client, link, UA)
     return dl.content, stl["name"]
 
 
@@ -732,7 +790,7 @@ async def _thingiverse_import(thing_id: str, client: httpx.AsyncClient) -> tuple
     if not files:
         raise HTTPException(404, "no mesh files on that thing")
     f = max(files, key=lambda x: x.get("size") or 0)
-    dl = await client.get(f["download_url"], headers=auth, follow_redirects=True)
+    dl = await _safe_get(client, f["download_url"], auth)
     return dl.content, f["name"]
 
 
@@ -760,7 +818,7 @@ async def import_url(req: ImportUrlRequest):
                                      "download the file in your browser, then attach it "
                                      "with the \U0001F4E6 button")
         elif url.lower().split("?")[0].endswith((".stl", ".3mf", ".obj")):
-            dl = await client.get(url, headers=UA, follow_redirects=True)
+            dl = await _safe_get(client, url, UA)
             raw, name = dl.content, Path(httpx.URL(url).path).name
         else:
             raise HTTPException(400, "unsupported link — paste a Printables/Thingiverse "
@@ -984,8 +1042,7 @@ async def _autoname(model_id: str, prompt: str):
         pass  # naming is best-effort garnish
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
+async def _run_generate(req: GenerateRequest, emit):
     images = []
     if req.image:
         try:
@@ -1038,6 +1095,7 @@ async def generate(req: GenerateRequest):
             f"user-provided reference photo.\nModification request: {req.prompt}{float_note}"
         )
         global LAST_BACKEND
+        await emit("llm", "Editing the model…")
         scad = await asyncio.to_thread(call_codex_edit, req.current_scad, instruction, images)
         LAST_BACKEND = "codex/gpt-5.5 (edit)"
         # deterministic lock enforcement: diff the locked modules, force a fix if touched
@@ -1053,8 +1111,10 @@ async def generate(req: GenerateRequest):
             broken = lock_violations(req.current_scad, scad, ps)
         lock_issues = broken
         try:
+            await emit("render", "Rendering STL…")
             stl = render_stl(scad, {})
         except HTTPException as e:
+            await emit("fixing", "Fixing render error…")
             scad = await asyncio.to_thread(
                 call_codex_edit, scad,
                 f"The file fails to render with this error:\n{e.detail}\nFix it.")
@@ -1066,11 +1126,14 @@ async def generate(req: GenerateRequest):
                                           + _taste_example(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
+        await emit("llm", "Writing OpenSCAD…")
         scad = await call_llm(messages, images)
         # validate by rendering; on failure, one automatic retry with the error fed back
         try:
+            await emit("render", "Rendering STL…")
             stl = render_stl(scad, {})
         except HTTPException as e:
+            await emit("fixing", "Fixing render error…")
             messages += [
                 {"role": "assistant", "content": scad},
                 {"role": "user", "content": f"That code failed to render:\n{e.detail}\nFix it and return the complete corrected file."},
@@ -1090,7 +1153,8 @@ async def generate(req: GenerateRequest):
             except HTTPException:
                 pass  # unrenderable previous state; fall back to the upload
         fixes = 0
-        for _ in range(QA_ROUNDS):
+        for _qa_i in range(QA_ROUNDS):
+            await emit(f"qa_round_{_qa_i + 1}", f"Vision QA round {_qa_i + 1}…")
             try:
                 ps_note = part_state_block(load_part_state(req.parent_id))
                 scad, stl, status = await vision_qa(
@@ -1108,6 +1172,7 @@ async def generate(req: GenerateRequest):
         else:
             qa = f"fixed x{fixes}"
 
+    await emit("report", "Building print report…")
     model_id = save_to_library(req.prompt, scad, stl,
                                load_intent(req.parent_id) + [req.prompt], req.parent_id)
     try:
@@ -1144,6 +1209,66 @@ async def generate(req: GenerateRequest):
             "lock_violations": lock_issues, "report": report,
             "print_warning_details": warning_details,
             "profile_used": prof["name"], "profile_override": prof_override}
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+@app.post("/generate")
+async def generate(req: GenerateRequest, stream: int = 1):
+    # stream=0 keeps the original single-JSON response (unchanged contract for
+    # any non-SSE caller); default streams stage events as Server-Sent Events.
+    if not stream:
+        async def _noop(*_a, **_k):
+            return
+        return await _run_generate(req, _noop)
+
+    q: asyncio.Queue = asyncio.Queue()
+    state = {"stage": "start"}  # last active stage, for labelling an error
+
+    async def emit(stage: str, label: str = ""):
+        state["stage"] = stage
+        await q.put({"stage": stage, "label": label, "ts": _now_ms()})
+
+    async def _run():
+        try:
+            result = await _run_generate(req, emit)
+            await q.put({"stage": "done", "ts": _now_ms(), "result": result})
+        except HTTPException as e:
+            await q.put({"stage": "error", "failed": state["stage"],
+                         "detail": str(e.detail), "ts": _now_ms()})
+        except Exception as e:  # never leak a stack trace to the client
+            await q.put({"stage": "error", "failed": state["stage"],
+                         "detail": str(e), "ts": _now_ms()})
+        finally:
+            await q.put(None)  # sentinel: stream done
+
+    async def gen():
+        task = asyncio.create_task(_run())
+        try:
+            while True:
+                # keepalive comment every 15s so the long codex step (running in
+                # a thread) keeps the connection flushing through any proxy.
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    break
+                yield _sse(item)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/render")
@@ -1311,7 +1436,15 @@ async def organic(req: OrganicRequest):
 
 @app.get("/config")
 async def config():
-    return {"bambuddy": bool(BAMBUDDY_API_KEY), "organic": _organic_ready()}
+    return {
+        "bambuddy": bool(BAMBUDDY_API_KEY),
+        "organic": _organic_ready(),
+        "training_lab": EVOLUTION_LAB_CONFIG.training_lab_enabled,
+        "evolution": EVOLUTION_LAB_CONFIG.evolution_enabled,
+        "memory_learning": EVOLUTION_LAB_CONFIG.memory_learning_enabled,
+        "physical_feedback": EVOLUTION_LAB_CONFIG.physical_feedback_enabled,
+        "actual_training": EVOLUTION_LAB_CONFIG.actual_training_enabled,
+    }
 
 
 def _model_dir(model_id: str) -> Path:
@@ -1323,14 +1456,53 @@ def _model_dir(model_id: str) -> Path:
     return mdir
 
 
+def _public_model_meta(meta: dict) -> dict:
+    """Add browser-safe library identity/version fields without exposing paths."""
+    model_id = str(meta.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{12}", model_id):
+        raise ValueError("invalid public model id in metadata")
+    version = 1
+    parent = meta.get("parent")
+    seen = {model_id}
+    while isinstance(parent, str) and re.fullmatch(r"[0-9a-f]{12}", parent) and parent not in seen:
+        seen.add(parent)
+        parent_file = LIB_DIR / parent / "meta.json"
+        if not parent_file.exists():
+            break
+        version += 1
+        try:
+            parent = json.loads(parent_file.read_text()).get("parent")
+        except (OSError, ValueError, json.JSONDecodeError):
+            break
+    qa = str(meta.get("qa") or "").lower()
+    status = "qa_passed" if qa == "passed" else "qa_fixed" if qa.startswith("fixed") else "ready"
+    return {
+        **meta,
+        "library_id": model_id,
+        "latest_version": version,
+        "status": status,
+        "thumbnail_url": f"/models/{model_id}/thumb",
+        "model_url": f"/?model={model_id}",
+    }
+
+
 @app.get("/models")
 async def list_models():
     out = []
     for mdir in LIB_DIR.iterdir():
         meta = mdir / "meta.json"
         if meta.exists():
-            out.append(json.loads(meta.read_text()))
+            try:
+                out.append(_public_model_meta(json.loads(meta.read_text())))
+            except (ValueError, json.JSONDecodeError):
+                continue
     return sorted(out, key=lambda m: -m["created"])
+
+
+@app.get("/models/{model_id}/metadata")
+async def model_metadata(model_id: str):
+    mdir = _model_dir(model_id)
+    return _public_model_meta(json.loads((mdir / "meta.json").read_text()))
 
 
 @app.get("/models/{model_id}")
@@ -1338,7 +1510,7 @@ async def get_model(model_id: str):
     mdir = _model_dir(model_id)
     scad = (mdir / "model.scad").read_text()
     stl = render_stl(scad, {})
-    return {"meta": json.loads((mdir / "meta.json").read_text()),
+    return {"meta": _public_model_meta(json.loads((mdir / "meta.json").read_text())),
             "scad": scad, "params": parse_params(scad), "stl_id": stl.stem}
 
 
@@ -1364,29 +1536,43 @@ async def rate_model(model_id: str, req: RateRequest):
 
 
 def _taste_example(prompt: str) -> str:
-    """SCAD of the best-matching thumbs-up model — the user's own taste as a few-shot."""
+    """Few-shot from the user's ratings: the best-matching thumbs-up model to emulate
+    and the best-matching thumbs-down model to avoid."""
     words = set(re.findall(r"[a-z]{3,}", prompt.lower()))
-    best, best_score = None, 1  # require >=2 overlapping words
+    best = {1: (None, 1), -1: (None, 1)}  # sign -> (mdir, score); require >=2 word overlap
     for mdir in LIB_DIR.iterdir():
         mf = mdir / "meta.json"
         if not mf.exists():
             continue
         meta = json.loads(mf.read_text())
-        if meta.get("rating", 0) <= 0:
+        rating = meta.get("rating", 0)
+        if rating == 0:
             continue
+        sign = 1 if rating > 0 else -1
         mwords = set(re.findall(r"[a-z]{3,}",
                                 f"{meta.get('prompt', '')} {meta.get('name', '')}".lower()))
         score = len(words & mwords)
-        if score > best_score:
-            best, best_score = mdir, score
-    if not best:
-        return ""
-    scad = (best / "model.scad").read_text()
-    if len(scad) > 8000:
-        return ""
-    return ("\n\nUSER-APPROVED EXAMPLE — the user rated this result highly for a similar "
-            "request; match its conventions, printability choices and quality bar:\n"
-            + scad)
+        if score > best[sign][1]:
+            best[sign] = (mdir, score)
+
+    def _scad(mdir):  # None or the model, only if short enough to be a useful few-shot
+        if not mdir:
+            return None
+        s = (mdir / "model.scad").read_text()
+        return s if len(s) <= 8000 else None
+
+    out = ""
+    pos = _scad(best[1][0])
+    if pos:
+        out += ("\n\nUSER-APPROVED EXAMPLE — the user rated this result highly for a similar "
+                "request; match its conventions, printability choices and quality bar:\n"
+                + pos)
+    neg = _scad(best[-1][0])
+    if neg:
+        out += ("\n\nUSER-REJECTED EXAMPLE — the user rated this result poorly for a similar "
+                "request. Do NOT reproduce its approach; treat it as a cautionary "
+                "counter-example of what the user does not want:\n" + neg)
+    return out
 
 
 @app.patch("/models/{model_id}")
@@ -1485,6 +1671,339 @@ async def validate(req: ValidateRequest):
 async def delete_model(model_id: str):
     shutil.rmtree(_model_dir(model_id))
     return {"ok": True}
+
+
+def _lab_load_source(model_id: str) -> dict:
+    """Read a production model as an immutable lab input; never write back to it."""
+    mdir = _model_dir(model_id)
+    return {
+        "scad": (mdir / "model.scad").read_text(),
+        "meta": json.loads((mdir / "meta.json").read_text()),
+    }
+
+
+def _lab_wait_process(proc: subprocess.Popen, cancel_event, timeout: float) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+            raise RuntimeError("generation cancelled")
+        if time.monotonic() >= deadline:
+            os.killpg(proc.pid, signal.SIGKILL)
+            raise RuntimeError("generation subprocess timed out")
+        try:
+            return proc.communicate(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _lab_render_stl(scad: str, params: dict, cancel_event=None) -> Path:
+    job = WORK_DIR / uuid.uuid4().hex
+    scad_file, stl_file = job.with_suffix(".scad"), job.with_suffix(".stl")
+    scad_file.write_text(scad)
+    cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(stl_file), "--export-format", "binstl"]
+    for key, value in params.items():
+        if not re.fullmatch(r"\w+", key):
+            raise HTTPException(400, f"bad param name: {key}")
+        encoded = f'"{value}"' if isinstance(value, str) else str(value)
+        cmd += ["-D", f"{key}={encoded}"]
+    cmd.append(str(scad_file))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    _stdout, stderr = _lab_wait_process(proc, cancel_event, OPENSCAD_TIMEOUT)
+    if proc.returncode != 0 or not stl_file.exists():
+        raise HTTPException(422, f"OpenSCAD error:\n{stderr[-2000:]}")
+    if stl_file.stat().st_size > 100_000_000:
+        raise HTTPException(413, "STL too large")
+    return stl_file
+
+
+def _lab_render_png(scad_path: Path, out_png: Path, cancel_event=None) -> Path | None:
+    cmd = ["openscad", *OPENSCAD_ARGS, "-o", str(out_png), "--imgsize", "800,600", "--autocenter", "--viewall", "--camera", "0,0,0,70,0,25,340", "--projection", "p", str(scad_path)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    _lab_wait_process(proc, cancel_event, OPENSCAD_TIMEOUT)
+    return out_png if proc.returncode == 0 and out_png.exists() else None
+
+
+def _lab_codex_process(cmd: list[str], prompt: str, cancel_event, timeout: float) -> tuple[str, str]:
+    """Run one lab-only Codex process with cooperative, process-group cancellation."""
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=prompt, timeout=0.25)
+            if proc.returncode != 0:
+                raise RuntimeError(f"codex process failed (rc {proc.returncode}): {stderr[-1500:]}")
+            return stdout, stderr
+        except subprocess.TimeoutExpired:
+            pass
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                raise RuntimeError("generation cancelled")
+            if time.monotonic() >= deadline:
+                os.killpg(proc.pid, signal.SIGKILL)
+                raise RuntimeError("codex generation timed out")
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex process failed (rc {proc.returncode}): {stderr[-1500:]}")
+                return stdout, stderr
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def _lab_codex_fresh(prompt: str, cancel_event=None, images: list[str] | None = None) -> str:
+    out = WORK_DIR / f"lab-codex-{uuid.uuid4().hex}.txt"
+    cmd = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-o", str(out)]
+    for image in images or []:
+        cmd += ["-i", image]
+    cmd.append("-")
+    _stdout, stderr = _lab_codex_process(cmd, prompt, cancel_event, 900)
+    if not out.exists():
+        raise RuntimeError(f"codex generation failed: {stderr[-1500:]}")
+    return strip_fences(out.read_text())
+
+
+def _lab_codex_edit(scad: str, instruction: str, cancel_event=None) -> str:
+    job = WORK_DIR / f"lab-edit-{uuid.uuid4().hex}"
+    job.mkdir()
+    model = job / "model.scad"
+    model.write_text(scad)
+    prompt = (
+        f"{instruction}\n\nApply your changes by EDITING model.scad in this directory with precise, "
+        "minimal edits. Preserve every unrelated feature. Never rewrite an existing model from scratch."
+    )
+    cmd = ["codex", "exec", "-C", str(job), "-s", "workspace-write", "--skip-git-repo-check", "--ephemeral", "-"]
+    _stdout, stderr = _lab_codex_process(cmd, prompt, cancel_event, 900)
+    if not model.exists() or not model.read_text().strip():
+        raise RuntimeError(f"codex edit failed: {stderr[-1500:]}")
+    return model.read_text()
+
+
+def _lab_generate_initial_candidate(context: dict) -> dict:
+    if LLM_BACKEND != "codex":
+        raise RuntimeError("Evolution generation zero currently requires the codex backend")
+    profile = context.get("printer_profile") or {}
+    instruction = f"""{SYSTEM_PROMPT}
+
+Create generation zero for an isolated PrintForge evolution run.
+Return one complete OpenSCAD model that follows the validated design specification.
+
+DESIGN SPECIFICATION (law):
+{context['validated_spec']}
+
+LOCKED REQUIREMENTS (must be present and satisfied):
+{json.dumps(context.get('locked_constraints', []), indent=2)}
+
+PRINTER PROFILE:
+{json.dumps(profile, indent=2)}
+
+Do not claim validation, slicing, or physical testing. The pipeline will measure the result.
+"""
+    scad = _lab_codex_fresh(instruction, context.get("cancel_event"))
+    return {
+        "scad": scad, "backend": "codex/cli-default (fresh)",
+        "backend_calls": 1, "estimated_cost": 0,
+        "cost_estimate_status": "unavailable",
+    }
+
+
+def _lab_generate_candidate(parent_scad: str, context: dict) -> dict:
+    if LLM_BACKEND != "codex":
+        raise RuntimeError("Evolution candidate editing currently requires the codex backend")
+    mutation = context["mutation"]
+    memory = context.get("memory_rules", {})
+    applied = "\n".join(
+        f"- {rule.get('recommendation', '')} (confidence {rule.get('confidence', 0):.2f})"
+        for rule in memory.get("applied", [])
+    ) or "- none"
+    instruction = f"""You are the DESIGNER role in an isolated PrintForge A/B evolution run.
+Edit the supplied model.scad IN PLACE with the smallest possible change. Do not rewrite it.
+
+VALIDATED SPEC (law):
+{context['validated_spec']}
+
+HARD LOCKS (must remain exact):
+{json.dumps(context.get('locked_constraints', []), indent=2)}
+
+CONTROLLED MUTATION:
+{json.dumps(mutation, indent=2)}
+
+Expected benefit: {mutation.get('expected_benefit', '')}
+Relevant validated memory rules:
+{applied}
+
+Preserve every unrelated working feature, parameter, module, part role and export exclusion.
+Do not add an unrelated redesign. Do not claim QA, slicing, or physical validation.
+"""
+    scad = _lab_codex_edit(parent_scad, instruction, context.get("cancel_event"))
+    return {
+        "scad": scad,
+        "backend": "codex/cli-default (edit)",
+        "backend_calls": 1,
+        "estimated_cost": 0,
+        "cost_estimate_status": "unavailable",
+    }
+
+
+def _lab_constraint_findings(parent_scad: str, candidate_scad: str, locks: list) -> tuple[list[dict], list[str]]:
+    findings, failures = [], []
+    for index, lock in enumerate(locks):
+        if not isinstance(lock, dict):
+            findings.append({"issue_type": "lock_unverifiable", "severity": "error", "message": str(lock), "source": "constraint monitor"})
+            failures.append("critical_evidence_unavailable")
+            continue
+        kind, name = lock.get("type"), lock.get("name", f"lock-{index + 1}")
+        preserved = False
+        if kind == "module" and lock.get("name"):
+            before, after = module_block(parent_scad, lock["name"]), module_block(candidate_scad, lock["name"])
+            preserved = after is not None and (
+                not parent_scad.strip()
+                or (before is not None and re.sub(r"\s+", "", before) == re.sub(r"\s+", "", after))
+            )
+        elif kind == "parameter" and lock.get("name"):
+            pattern = re.compile(rf"^\s*{re.escape(lock['name'])}\s*=\s*([^;]+);", re.MULTILINE)
+            before, after = pattern.search(parent_scad), pattern.search(candidate_scad)
+            expected = lock.get("value")
+            preserved = bool(after and (
+                (not parent_scad.strip() and (expected is None or after.group(1).strip().strip('"') == str(expected).strip().strip('"')))
+                or (before and before.group(1).strip() == after.group(1).strip())
+            ))
+        elif kind == "literal" and lock.get("value") is not None:
+            literal = str(lock["value"])
+            preserved = literal in candidate_scad and (not parent_scad.strip() or literal in parent_scad)
+        if not preserved:
+            findings.append({"issue_type": "broken_hard_lock", "severity": "critical", "message": f"Hard lock not preserved: {name}", "source": "deterministic source diff"})
+            failures.append("broken_hard_lock" if kind in {"module", "parameter", "literal"} else "critical_evidence_unavailable")
+    return findings, failures
+
+
+def _lab_ai_review(scad: str, context: dict, report: dict, issues: list[dict], images: list[str]) -> tuple[list[dict], int]:
+    prompt = f"""You are the independent FUNCTION CRITIC, PROMPT/SPEC AUDITOR, PRINT ENGINEER,
+STRUCTURAL REVIEWER, ERGONOMICS REVIEWER, and SIMPLICITY REVIEWER for PrintForge.
+The DESIGNER did not score this output. Judge only the supplied SCAD, deterministic report,
+issues and renders. Unknown claims get zero. Never claim slicing or physical verification.
+Return JSON only with keys function, adherence, structural, ergonomics, simplicity. Each value
+must be {{"points": number, "reason": string}}. Caps respectively: 18, 16, 7, 6, 7.
+
+SPEC:\n{context['validated_spec'][:30000]}
+MUTATION:\n{json.dumps(context['mutation'])}
+REPORT:\n{json.dumps(report)}
+DETERMINISTIC ISSUES:\n{json.dumps(issues)}
+SCAD SOURCE:\n{scad[:30000]}
+"""
+    try:
+        judged = json.loads(_lab_codex_fresh(prompt, context.get("cancel_event"), images))
+    except Exception:
+        return [
+            {"category": "function", "criterion": "functional behavior", "points_awarded": 0, "points_possible": 25, "label": "UNVERIFIED", "source": "independent reviewer unavailable", "summary": "No independent function review", "confidence": 0, "critical": True},
+            {"category": "prompt_spec_adherence", "criterion": "spec adherence", "points_awarded": 0, "points_possible": 16, "label": "UNVERIFIED", "source": "independent reviewer unavailable", "summary": "No independent spec review", "confidence": 0, "critical": True},
+        ], 0
+    mapping = {
+        "function": ("function", 18, 25), "adherence": ("prompt_spec_adherence", 16, 16),
+        "structural": ("structural_quality", 7, 10), "ergonomics": ("user_experience_ergonomics", 6, 10),
+        "simplicity": ("simplicity_efficiency", 7, 10),
+    }
+    evidence = []
+    for key, (category, cap, possible) in mapping.items():
+        item = judged.get(key) if isinstance(judged, dict) else None
+        points = max(0.0, min(float((item or {}).get("points", 0)), cap))
+        evidence.append({
+            "category": category, "criterion": f"independent {key} review",
+            "points_awarded": points, "points_possible": possible, "label": "AI-JUDGED",
+            "source": "independent codex review of SCAD, metrics and renders",
+            "summary": str((item or {}).get("reason", "No rationale supplied"))[:2000],
+            "confidence": 0.55, "critical": key in {"function", "adherence"},
+        })
+    return evidence, 1
+
+
+def _lab_evaluate_candidate(scad: str, context: dict) -> dict:
+    cancel_event = context.get("cancel_event")
+    stl = _lab_render_stl(scad, {}, cancel_event)
+    profile = context.get("printer_profile") or {}
+    report = print_report(stl, profile)
+    try:
+        floats = floating_starts(stl)
+    except Exception:
+        floats = []
+    issues = [{
+        "issue_type": "floating_geometry", "severity": "warning",
+        "coordinates": [item.get("x"), item.get("y"), item.get("z")],
+        "message": f"Feature starts in mid-air near x={item.get('x')}, y={item.get('y')}, z={item.get('z')}mm",
+        "source": "floating_starts",
+    } for item in floats]
+    lock_issues, failure_codes = _lab_constraint_findings(context.get("parent_scad", ""), scad, context.get("locked_constraints", []))
+    issues.extend(lock_issues)
+    bed_ok = report.get("bed_fit") == "ok"
+    if not bed_ok:
+        failure_codes.append("build_volume_overflow")
+    evidence = [
+        {"category": "printability", "criterion": "render and export", "points_awarded": 4, "points_possible": 4, "label": "MEASURED", "source": "OpenSCAD render", "summary": "Candidate rendered to STL", "confidence": 1, "critical": True},
+        {"category": "printability", "criterion": "watertight geometry", "points_awarded": 6 if report.get("watertight") else 0, "points_possible": 6, "label": "MEASURED", "source": "trimesh", "summary": "Watertight mesh check", "confidence": 1, "critical": False},
+        {"category": "printability", "criterion": "floating regions", "points_awarded": 5 if not floats else 0, "points_possible": 5, "label": "MEASURED", "source": "floating_starts", "summary": f"{len(floats)} reported floating starts", "confidence": 0.9, "critical": False},
+        {"category": "printability", "criterion": "build volume", "points_awarded": 4 if bed_ok else 0, "points_possible": 4, "label": "MEASURED", "source": "print_report", "summary": report.get("bed_fit", "unavailable"), "confidence": 1, "critical": True},
+        {"category": "printability", "criterion": "component structure", "points_awarded": 3, "points_possible": 3, "label": "MEASURED", "source": "trimesh connected components", "summary": f"{report.get('parts')} components; intent review required", "confidence": 0.7, "critical": False},
+    ]
+    if context.get("attached_reference_roles") or context.get("export_exclusions"):
+        evidence.append({"category": "prompt_spec_adherence", "criterion": "reference geometry excluded from export", "points_awarded": 0, "points_possible": 4, "label": "UNVERIFIED", "source": "no post-export role verifier", "summary": "Reference leakage cannot yet be proved deterministically", "confidence": 0, "critical": True})
+    else:
+        evidence.append({"category": "prompt_spec_adherence", "criterion": "no reference export scope", "points_awarded": 4, "points_possible": 4, "label": "MEASURED", "source": "run configuration", "summary": "No attached reference-only geometry in this run", "confidence": 1, "critical": False})
+    if context.get("locked_constraints"):
+        evidence.append({"category": "prompt_spec_adherence", "criterion": "hard locks preserved", "points_awarded": 4 if not lock_issues else 0, "points_possible": 4, "label": "MEASURED", "source": "deterministic source diff", "summary": "All concrete locks preserved" if not lock_issues else "One or more locks failed", "confidence": 1, "critical": True})
+    preview = _lab_render_png(stl.with_suffix(".scad"), stl.with_name("lab-preview.png"), cancel_event)
+    images = [str(preview)] if preview and preview.exists() else []
+    ai_evidence, review_calls = _lab_ai_review(scad, context, report, issues, images)
+    evidence.extend(ai_evidence)
+    artifacts = {
+        "model.stl": stl.read_bytes(),
+        "geometry-report.json": json.dumps(report, indent=2),
+        "qa-findings.json": json.dumps(issues, indent=2),
+    }
+    if preview and preview.exists():
+        artifacts["preview.png"] = preview.read_bytes()
+    return {
+        "evidence": evidence, "failure_codes": failure_codes, "issues": issues,
+        "qa_results": {"status": "evaluated", "deterministic": True, "ai_review": bool(review_calls)},
+        "slicer_results": {"status": "skipped", "reason": "no slicer backend configured"},
+        "artifacts": artifacts, "backend_calls": review_calls, "estimated_cost": 0,
+        "cost_estimate_status": "unavailable",
+    }
+
+
+def _lab_current_branch() -> str:
+    result = subprocess.run(["git", "branch", "--show-current"], cwd=Path(__file__).parent, capture_output=True, text=True, timeout=2)
+    return result.stdout.strip() or "detached"
+
+
+app.include_router(create_router(
+    EVOLUTION_LAB_CONFIG,
+    EvolutionAdapters(
+        load_source_model=_lab_load_source,
+        generate_initial_candidate=_lab_generate_initial_candidate,
+        generate_candidate=_lab_generate_candidate,
+        evaluate_candidate=_lab_evaluate_candidate,
+        current_branch=_lab_current_branch,
+    ),
+    production_branch="main",
+))
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True))

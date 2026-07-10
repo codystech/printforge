@@ -4,8 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PrintForge</title>
+<link rel="stylesheet" href="./vendor/tokens.css">
 <style>
   * { box-sizing: border-box; margin: 0; }
+  [hidden] { display: none !important; }  /* author display rules (.iconbtn, inline flex) must not override the hidden attribute */
   body { font: 14px/1.4 system-ui, sans-serif; background: #16181d; color: #e6e6e6; display: flex; height: 100vh; }
   #panel { width: 360px; min-width: 360px; padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; background: #1e2128; border-right: 1px solid #2c3038; }
   #viewer { flex: 1; position: relative; }
@@ -31,20 +33,62 @@
   #status.error { color: #ff7b72; }
   #status.good { color: #7bd88f; }
   details { font-size: 12px; } details pre { background: #14161a; padding: 8px; border-radius: 6px; overflow-x: auto; max-height: 240px; }
+  /* shared dark input/select/textarea surface (was repeated inline ~7×) */
+  .field { background: #14161a; color: #e6e6e6; border: 1px solid #3a3f48; border-radius: var(--radius-2); padding: var(--size-2) var(--size-3); font: inherit; }
+  /* icon + text-label button (vendored inline Lucide SVGs) */
+  .iconbtn { display: inline-flex; align-items: center; gap: 5px; }
+  .iconbtn svg { width: 15px; height: 15px; flex: 0 0 auto; }
   #lib { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
-  .libitem { background: #2a2e36; border-radius: 6px; overflow: hidden; cursor: pointer; }
+  .libitem { position: relative; background: #2a2e36; border-radius: var(--radius-2); overflow: hidden; cursor: pointer; }
   .libitem img { width: 100%; height: 80px; object-fit: cover; display: block; background: #14161a; }
+  .libitem .qabadge { position: absolute; top: 4px; left: 4px; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: var(--radius-round); background: rgba(0,0,0,.62); pointer-events: none; }
+  .libitem .qabadge.ok { color: #7bd88f; } .libitem .qabadge.warn { color: #ffb86b; }
+  .libitem .prof { font-size: 10px; color: #6b7280; padding: 0 6px 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .libitem .idline { display:flex; align-items:center; justify-content:space-between; gap:4px; padding:0 6px 5px; color:#8a93a3; font:10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .libitem .idline code { user-select:text; }
+  .libitem .idline button { padding:1px 5px; color:#9fb2c8; border:1px solid #3a3f48; background:#20242b; font-size:9px; }
   .libitem .row { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
   .libitem .name { flex: 1; font-size: 11px; color: #ccd; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .libitem .row button { padding: 1px 5px; font-size: 11px; font-weight: 400; background: none; color: #778; }
   .libitem .row button:hover { color: #e6e6e6; }
   .libitem .row button.armed { color: #ff7b72; font-weight: 700; }
+  /* rename/duplicate/download/delete/copy reveal — hover on desktop, ⋯ tap on touch (never hover-only) */
+  .libitem .acts { display: none; gap: 4px; align-items: center; }
+  .libitem.open .acts { display: flex; }
+  @media (hover: hover) {
+    .libitem:hover .acts, .libitem:focus-within .acts { display: flex; }
+    .libitem .menu { display: none; }
+  }
   .btnrow { display: flex; gap: 8px; } .btnrow button { flex: 1; }
+  /* generation step indicator (SSE progress) */
+  #gensteps { display: none; flex-direction: column; gap: 4px; font-size: 12px; margin-top: 2px; }
+  #gensteps.on { display: flex; }
+  .gstep { display: flex; align-items: center; gap: 7px; color: #5c6470; }
+  .gstep .ico { width: 15px; height: 15px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; border: 1.5px solid currentColor; font-size: 10px; line-height: 1; }
+  .gstep.done { color: #7bd88f; } .gstep.active { color: #e8734a; } .gstep.failed { color: #ff7b72; }
+  .gstep.active .ico { animation: gpulse 1s ease-in-out infinite; }
+  .gstep .sub { color: #8a93a3; font-size: 11px; }
+  #genelapsed { margin-left: auto; color: #8a93a3; font-size: 11px; }
+  @keyframes gpulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  /* print-report status pills */
+  #printinfo { display: none; flex-wrap: wrap; gap: 5px; align-items: center; }
+  #printinfo.on { display: flex; }
+  #modelidentity { display:none; align-items:center; gap:7px; padding:6px 8px; border:1px solid #3a3f48; border-radius:6px; color:#8a93a3; background:#181b21; font-size:11px; }
+  #modelidentity.on { display:flex; }
+  #modelidentity code { color:#d4deeb; user-select:text; font:12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+  #modelidentity button { margin-left:auto; padding:3px 7px; font-size:10px; }
+  .pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid; cursor: default; }
+  .pill.ok { color: #7bd88f; background: #17251b; border-color: #2f5d3a; }
+  .pill.warn { color: #ffb86b; background: #251f17; border-color: #5d4a2f; }
+  .pill.bad { color: #ff7b72; background: #251717; border-color: #5d2f2f; }
+  .pill.info { color: #aab; background: #22262e; border-color: #3a3f48; }
+  /* viewer empty-state hint */
+  #viewerhint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #5c6470; font-size: 15px; pointer-events: none; }
 </style>
 </head>
 <body>
 <div id="panel">
-  <h1 style="display:flex;justify-content:space-between;align-items:center">Print<span style="flex:1">Forge</span><button id="helpbtn" class="secondary" style="padding:2px 10px;font-size:13px" title="how everything works">?</button></h1>
+  <h1 style="display:flex;justify-content:space-between;align-items:center;gap:6px">Print<span style="flex:1">Forge</span><a id="traininglab" href="/training-lab/" class="secondary" hidden style="padding:3px 8px;border-radius:6px;color:#54d7dc;text-decoration:none;font-size:10px" title="open the isolated evolution laboratory">Training Lab</a><button id="helpbtn" class="secondary" style="padding:2px 10px;font-size:13px" title="how everything works">?</button></h1>
   <div id="helpbox" style="display:none;font-size:12px;line-height:1.5;background:#14161a;border:1px solid #3a3f48;border-radius:6px;padding:10px;color:#ccd">
     <b>Four ways to make a model</b><br>
     ✦ <b>Words → part</b>: describe it, hit <b>✍ Spec</b>, fix the ASSUMPTIONS lines, then <i>Generate from spec</i>. (Plain Generate skips the review.)<br>
@@ -74,20 +118,21 @@
     <span id="imgchip"><img id="imgprev"><b id="imgclear">✕</b></span>
     <button id="meshbtn" class="secondary" type="button" title="attach an STL/3MF/OBJ to remix, or a logo image to trace">📦 base model</button>
     <input id="meshfile" type="file" accept=".stl,.3mf,.obj,.glb,.gltf,.step,.stp,.svg,image/png,image/jpeg" multiple hidden>
-    <button id="linkbtn" class="secondary" type="button" title="import a model from a Printables/Thingiverse link">🔗</button>
-    <button id="orgbtn" class="secondary" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)">🧬</button>
-    <button id="calbtn" class="secondary" type="button" title="tolerance test coupon: print it, test which peg fits which hole, record winners in My presets">🧪</button>
+    <button id="linkbtn" class="secondary iconbtn" type="button" title="import a model from a Printables/Thingiverse link"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>link</button>
+    <button id="orgbtn" class="secondary iconbtn" type="button" hidden title="AI-sculpt a mesh from a photo (1-3 min)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .962 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.962 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/></svg>organic</button>
+    <button id="calbtn" class="secondary iconbtn" type="button" title="tolerance test coupon: print it, test which peg fits which hole, record winners in My presets"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v7.31"/><path d="M14 9.3V1.99"/><path d="M8.5 2h7"/><path d="M14 9.3a6.5 6.5 0 1 1-4 0"/><path d="M5.52 16h12.96"/></svg>calibrate</button>
     <input id="orgfile" type="file" accept="image/*" hidden>
-    <input id="orgsize" type="number" value="80" min="10" max="250" hidden style="width:52px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:4px" title="target size (mm)">
+    <label id="orgsizewrap" hidden style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#aab" title="target size (mm)">target mm <input id="orgsize" type="number" value="80" min="10" max="250" class="field" style="width:52px;padding:4px"></label>
     <span id="meshchips" style="display:inline-flex;flex-wrap:wrap;gap:6px;font-size:12px;color:#aab"></span>
   </div>
-  <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" style="display:none;width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px">
-  <select id="profilesel" title="active printer profile: feeds bed size, nozzle, material, clearances and weight estimates into every spec and generation" style="width:100%;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:6px;padding:6px;font-size:12px"></select>
+  <input id="linkinput" type="text" placeholder="paste a Printables / Thingiverse model link (or direct .stl url) and press Enter" class="field" style="display:none;width:100%;padding:6px 8px;font-size:12px">
+  <select id="profilesel" title="active printer profile: feeds bed size, nozzle, material, clearances and weight estimates into every spec and generation" class="field" style="width:100%;padding:6px;font-size:12px"></select>
   <div class="btnrow"><button id="go">Generate</button><button id="specbtn" class="secondary" title="expand your prompt into an editable design spec first">✍ Spec</button></div>
   <textarea id="specbox" style="display:none;height:180px;font-size:12px" placeholder="design spec — edit anything, then Generate from spec"></textarea>
   <button id="specgen" style="display:none">Generate from spec</button>
   <button id="new" class="secondary" hidden>New model (start fresh)</button>
   <div id="status"></div>
+  <div id="gensteps"></div>
   <div id="partsbox" style="display:none">
     <b style="font-size:12px;color:#aab">Parts</b>
     <label style="float:right;font-size:12px;color:#aab"><input type="checkbox" id="asmtoggle"> assembled view</label>
@@ -95,9 +140,10 @@
     <button id="validatebtn" class="secondary" style="margin-top:6px;width:100%" title="render each part in assembled position and check collisions and clearances">🔧 Validate assembly</button>
     <div id="valreport" style="font-size:12px;color:#ffb86b;white-space:pre-wrap"></div>
   </div>
-  <div id="printinfo" style="display:none;font-size:12px;color:#8a93a3"></div>
+  <div id="printinfo"></div>
+  <div id="modelidentity"><span>Library ID</span><code id="modelidtext"></code><span id="modelversion"></span><button id="copymodelid" class="secondary" type="button">Copy ID</button></div>
   <div id="diffinfo" style="display:none;font-size:12px;color:#8a93a3"></div>
-  <button id="fixbtn" class="secondary" hidden title="send the detected problems back as a repair refine">🩹 Fix detected issues</button>
+  <button id="fixbtn" class="secondary iconbtn" hidden title="send the detected problems back as a repair refine"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>fix detected issues</button>
   <details id="presetsbox"><summary style="font-size:12px;color:#aab">My presets (sizes the AI should assume)</summary>
     <textarea id="presets" style="height:110px;font-size:12px;margin-top:4px"></textarea>
   </details>
@@ -112,11 +158,12 @@
   </div>
   <details hidden id="codebox"><summary>OpenSCAD source</summary><pre id="code"></pre></details>
   <details id="libbox"><summary>Library</summary>
-    <input id="libsearch" type="text" placeholder="search prompts/names…" style="width:100%;margin-top:6px;background:#14161a;color:#e6e6e6;border:1px solid #3a3f48;border-radius:4px;padding:5px 8px;font-size:12px">
+    <input id="libsearch" type="text" placeholder="search prompts/names…" class="field" style="width:100%;margin-top:6px;padding:5px 8px;font-size:12px;border-radius:var(--radius-1)">
     <div id="lib"></div>
   </details>
 </div>
 <div id="viewer">
+  <div id="viewerhint">describe a model to get started</div>
   <div style="position:absolute;top:8px;right:8px;display:flex;gap:6px;z-index:5">
     <button id="vfit" class="secondary" style="padding:4px 10px;font-size:12px" title="zoom to fit">⛶</button>
     <button id="vtop" class="secondary" style="padding:4px 10px;font-size:12px" title="top view (check lid text & cutouts)">⬆ top</button>
@@ -151,12 +198,38 @@ const world = new THREE.Group();
 world.rotation.x = -Math.PI / 2;
 scene.add(world);
 const scadToWorld = v => new THREE.Vector3(v.x, v.z, -v.y);
-// Bambu bed 256x256, origin at front-left corner (grid lives in screen-floor space)
-const grid = new THREE.GridHelper(256, 16, 0x3a3f48, 0x24272e);
-grid.position.set(128, 0, -128);
-scene.add(grid);
 const origin = new THREE.AxesHelper(20);
 world.add(origin);
+// build plate: the active profile's bed drawn true-scale in screen-floor space.
+// bed corner (bedX,bedY) maps to scene (bedX,0,-bedY); scad origin at front-left.
+let bedGroup = null;
+function makeLabel(text, pos, color) {
+  const c = document.createElement('canvas'); c.width = 160; c.height = 44;
+  const cx = c.getContext('2d');
+  cx.font = 'bold 24px system-ui'; cx.fillStyle = color; cx.textBaseline = 'middle';
+  cx.fillText(text, 4, 22);
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthTest: false }));
+  spr.position.copy(pos); spr.scale.set(48, 13, 1);
+  return spr;
+}
+function drawBed(bed) {
+  if (!bed) return;
+  if (bedGroup) { scene.remove(bedGroup); bedGroup.traverse(o => { o.geometry?.dispose(); if (o.material) { o.material.map?.dispose?.(); o.material.dispose(); } }); }
+  bedGroup = new THREE.Group();
+  const [bx, by] = bed;
+  bedGroup.add(new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints([[0, 0], [bx, 0], [bx, by], [0, by]].map(([x, y]) => new THREE.Vector3(x, 0, -y))),
+    new THREE.LineBasicMaterial({ color: 0x5a6270 })));
+  const pts = [], step = 20;
+  for (let x = step; x < bx; x += step) pts.push(new THREE.Vector3(x, 0, 0), new THREE.Vector3(x, 0, -by));
+  for (let y = step; y < by; y += step) pts.push(new THREE.Vector3(0, 0, -y), new THREE.Vector3(bx, 0, -y));
+  bedGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0x2b2f38 })));
+  bedGroup.add(makeLabel(`X ${bx}`, new THREE.Vector3(bx + 14, 0, 0), '#e8734a'));
+  bedGroup.add(makeLabel(`Y ${by}`, new THREE.Vector3(0, 0, -by - 14), '#7bd88f'));
+  scene.add(bedGroup);
+  needsRender = true;
+}
 let mesh = null, lastFit = null;
 function setCam(fx, fy, fz) {
   if (!lastFit) return;
@@ -176,6 +249,7 @@ resize();
 camera.position.set(300, 220, 60);
 controls.target.set(128, 15, -128);
 let needsRender = true;
+drawBed([220, 220, 250]);  // sensible default until /profiles resolves the active bed
 controls.addEventListener('change', () => { needsRender = true; });
 window.addEventListener('resize', () => { needsRender = true; });
 (function animate() {
@@ -184,12 +258,16 @@ window.addEventListener('resize', () => { needsRender = true; });
 })();
 
 const loader = new STLLoader();
-async function showStl(id, fit) {
+let bboxHelper = null;
+async function showStl(id, fit, bedFitOk = true) {
   const geo = loader.parse(await (await fetch(`/stl/${id}`)).arrayBuffer());
   geo.computeVertexNormals();
   if (mesh) { world.remove(mesh); mesh.geometry.dispose(); }
   mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xe8734a, roughness: 0.55, metalness: 0.05 }));
   world.add(mesh);
+  if (bboxHelper) { scene.remove(bboxHelper); bboxHelper.geometry.dispose(); bboxHelper = null; }
+  if (!bedFitOk) { mesh.updateMatrixWorld(true); bboxHelper = new THREE.BoxHelper(mesh, 0xff5555); scene.add(bboxHelper); }
+  $('viewerhint').style.display = 'none';
   needsRender = true;
   geo.computeBoundingSphere();
   lastFit = { c: scadToWorld(geo.boundingSphere.center), r: Math.max(20, geo.boundingSphere.radius) };
@@ -373,6 +451,14 @@ async function api(path, body, method = 'POST') {
 function showModel(r, statusMsg, cls = 'good') {
   scad = r.scad; stlId = r.stl_id;
   currentModelId = r.model_id ?? r.meta?.id ?? currentModelId;
+  const identity = $('modelidentity');
+  identity.classList.toggle('on', Boolean(currentModelId));
+  $('modelidtext').textContent = currentModelId ?? '';
+  $('modelversion').textContent = currentModelId ? `v${r.meta?.latest_version ?? 1} · ${String(r.meta?.status ?? 'ready').replaceAll('_', ' ')}` : '';
+  if (currentModelId) {
+    const url = new URL(location.href); url.searchParams.set('model', currentModelId);
+    history.replaceState(null, '', url);
+  }
   $('rulesbox').style.display = currentModelId ? 'block' : 'none';
   $('rules').value = (r.meta?.rules ?? r.rules ?? []).join('\n');
   partState = r.meta?.part_state ?? r.part_state ?? {};
@@ -399,21 +485,131 @@ function showModel(r, statusMsg, cls = 'good') {
   }).catch(() => {});
   modelProfile = r.profile_used ?? r.meta?.profile?.name ?? null;
   const rep = r.report ?? r.meta?.report;
-  $('printinfo').style.display = rep?.bbox_mm ? 'block' : 'none';
-  if (rep?.bbox_mm) $('printinfo').textContent =
-    `${rep.bbox_mm.join(' × ')} mm · ${rep.parts} part${rep.parts > 1 ? 's' : ''}` +
-    (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g ${rep.material ?? 'PLA'}` : '') +
-    (rep.watertight ? ' · watertight ✓' : ' · ⚠ not watertight') +
-    (rep.measured ? ` · measured ${rep.measured}` : '') +
-    ` · 🖨 ${rep.profile ?? modelProfile ?? 'unknown/legacy'}` +
-    (rep.bed_fit && rep.bed_fit !== 'ok' ? ` · ⚠ ${rep.bed_fit}` : '');
+  const pi = $('printinfo');
+  pi.innerHTML = '';
+  pi.classList.toggle('on', !!rep?.bbox_mm);
+  if (rep?.bbox_mm) {
+    const pill = (text, state, detail) => {
+      const s = document.createElement('span');
+      s.className = `pill ${state}`; s.textContent = text;
+      if (detail) s.title = detail;
+      pi.appendChild(s);
+    };
+    pill(`${rep.bbox_mm.join(' × ')} mm`, 'info',
+      `bounding box W×D×H · ${rep.parts} part${rep.parts > 1 ? 's' : ''}` +
+      (rep.est_grams_pla ? ` · ~${rep.est_grams_pla}g ${rep.material ?? 'PLA'}` : '') +
+      (rep.measured ? ` · measured ${rep.measured}` : '') +
+      ` · 🖨 ${rep.profile ?? modelProfile ?? 'unknown/legacy'}`);
+    pill(rep.watertight ? 'watertight ✓' : 'not watertight ✗', rep.watertight ? 'ok' : 'bad',
+      rep.watertight ? 'mesh is a closed solid' : 'mesh is not a closed solid — may not slice cleanly');
+    pill(rep.bed_fit === 'ok' ? 'fits bed ✓' : 'bed ✗', rep.bed_fit === 'ok' ? 'ok' : 'bad',
+      rep.bed_fit === 'ok' ? 'model fits the active printer bed' : rep.bed_fit);
+    const fw = r.print_warnings ?? 0;
+    pill(fw ? `${fw} floating ⚠` : 'no floating ✓', fw ? 'warn' : 'ok',
+      fw ? ((r.print_warning_details ?? []).join('\n') || 'features start mid-air; slice with supports or 🩹 fix')
+         : 'no mid-air features detected');
+    // "(when present)" pills — populated by a future generation-quality campaign; hidden until then
+    if (rep.dims_vs_spec) pill(`dims ${rep.dims_vs_spec.ok ? '✓' : '✗'}`, rep.dims_vs_spec.ok ? 'ok' : 'bad', rep.dims_vs_spec.detail ?? '');
+    if (rep.overhang) pill(`overhang ${rep.overhang.ok ? '✓' : '⚠'}`, rep.overhang.ok ? 'ok' : 'warn', rep.overhang.detail ?? '');
+  }
   if (r.profile_override) statusMsg += ` — ⚠ ${r.profile_override}`;
   buildParams(r.params);
   $('code').textContent = scad;
   for (const id of ['new', 'download', 'download3mf', 'codebox']) $(id).hidden = false;
   $('send').hidden = !window.bambuddyOn;
   $('go').textContent = 'Refine';
-  return showStl(stlId, true).then(() => setStatus(statusMsg, cls));
+  return showStl(stlId, true, (rep?.bed_fit ?? 'ok') === 'ok').then(() => setStatus(statusMsg, cls));
+}
+
+// --- generation step indicator (driven by /generate SSE stage events) ---
+const GEN_STEPS = [
+  { key: 'llm', label: 'Write model' },
+  { key: 'render', label: 'Render' },
+  { key: 'qa', label: 'Vision QA' },
+  { key: 'report', label: 'Report' },
+];
+let genState = null, genTimer = null;
+const stageBase = stage =>
+  stage.startsWith('qa_round') ? 'qa'
+  : stage === 'fixing' ? (genState?.active ?? 'render')
+  : stage;  // llm | render | report
+const elapsedStr = () => `${Math.round((Date.now() - genState.t0) / 1000)}s`;
+function renderGenSteps() {
+  const box = $('gensteps');
+  box.innerHTML = '';
+  const activeIdx = GEN_STEPS.findIndex(s => s.key === genState.active);
+  GEN_STEPS.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'gstep';
+    let ico = '•';
+    if (genState.failed === s.key) { row.classList.add('failed'); ico = '✕'; }
+    else if (genState.finished || genState.done.has(s.key) || (activeIdx >= 0 && i < activeIdx)) { row.classList.add('done'); ico = '✓'; }
+    else if (s.key === genState.active) row.classList.add('active');
+    const icoEl = document.createElement('span'); icoEl.className = 'ico'; icoEl.textContent = ico;
+    const lbl = document.createElement('span'); lbl.textContent = s.label;
+    row.append(icoEl, lbl);
+    if (s.key === genState.active && genState.sub[s.key]) {
+      const sp = document.createElement('span'); sp.className = 'sub'; sp.textContent = genState.sub[s.key];
+      row.append(sp);
+    }
+    if (i === activeIdx && !genState.finished && !genState.failed) {
+      const el = document.createElement('span'); el.id = 'genelapsed'; el.textContent = elapsedStr();
+      row.append(el);
+    }
+    box.appendChild(row);
+  });
+}
+function genStart() {
+  genState = { active: null, done: new Set(), sub: {}, failed: null, finished: false, t0: Date.now() };
+  $('gensteps').classList.add('on');
+  clearInterval(genTimer);
+  genTimer = setInterval(() => { const e = $('genelapsed'); if (e) e.textContent = elapsedStr(); }, 1000);
+  renderGenSteps();
+}
+function genEvent(ev) {
+  if (!genState) return;
+  if (ev.stage === 'done') { genState.finished = true; genState.active = null; clearInterval(genTimer); renderGenSteps(); return; }
+  if (ev.stage === 'error') {
+    const fb = (ev.failed && ev.failed !== 'start') ? ev.failed : (genState.active ?? 'llm');
+    genState.failed = stageBase(fb);
+    genState.active = null;
+    clearInterval(genTimer); renderGenSteps(); return;
+  }
+  const base = stageBase(ev.stage);
+  const idx = GEN_STEPS.findIndex(s => s.key === base);
+  for (let i = 0; i < idx; i++) genState.done.add(GEN_STEPS[i].key);
+  genState.active = base;
+  if (ev.stage.startsWith('qa_round')) genState.sub.qa = ev.label || `round ${ev.stage.split('_').pop()}`;
+  else if (ev.stage === 'fixing') genState.sub[base] = 'fixing…';
+  renderGenSteps();
+}
+function genHide() { $('gensteps').classList.remove('on'); clearInterval(genTimer); genState = null; }
+
+// read the /generate SSE stream, calling onEvent(parsedJson) per stage event.
+// a non-stream error response (or ?stream=0) throws with the server detail.
+async function streamGenerate(body, onEvent) {
+  const resp = await fetch('/generate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!resp.ok || !resp.body) {
+    const text = await resp.text();
+    let detail; try { detail = JSON.parse(text).detail; } catch { detail = text; }
+    throw new Error(String(detail ?? resp.statusText).slice(0, 400));
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, sep); buf = buf.slice(sep + 2);
+      for (const line of frame.split('\n'))
+        if (line.startsWith('data:')) { try { onEvent(JSON.parse(line.slice(5).trim())); } catch {} }
+    }
+  }
 }
 
 let guardAcknowledged = false, profileAcknowledged = false, modelProfile = null;
@@ -433,20 +629,34 @@ async function generate(fresh) {
   }
   profileAcknowledged = false;
   $('go').disabled = $('new').disabled = true;
-  setBusyStatus(fresh ? 'Generating + vision check…' : 'Refining + vision check…');
+  setStatus('');
+  genStart();
+  let result = null, errEv = null;
   try {
-    const r = await api('/generate', { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_ids: meshIds.length ? meshIds : null, parent_id: fresh ? null : currentModelId, profile: $('profilesel').value || null });
-    let qaMsg = r.qa === 'passed' ? 'vision check: passed'
-      : r.qa?.startsWith('fixed') ? `vision check: ${r.qa.replace('x', '×')}`
-      : '';
-    if (r.print_warnings) qaMsg += ` — ⚠ ${r.print_warnings} floating spot(s), refine to fix or slice with supports`;
-    if (r.backend?.startsWith('local')) qaMsg += ` — ⚠ made by the local fallback model (codex rate-limited): expect crude results until the pool resets`;
-    $('prompt').value = '';
-    clearImage();
-    clearMesh();
-    await showModel(r, qaMsg);
-    loadLibrary();
-  } catch (e) { setStatus(e.message, 'error'); }
+    await streamGenerate(
+      { prompt, current_scad: fresh ? null : scad, image: refImage, mesh_ids: meshIds.length ? meshIds : null, parent_id: fresh ? null : currentModelId, profile: $('profilesel').value || null },
+      ev => { genEvent(ev); if (ev.stage === 'done') result = ev.result; else if (ev.stage === 'error') errEv = ev; }
+    );
+  } catch (e) {
+    genHide(); setStatus(e.message, 'error');
+    $('go').disabled = $('new').disabled = false; return;
+  }
+  if (errEv) {  // leave the ✕ stage visible; detail goes to the status line
+    setStatus(`stage "${errEv.failed}" failed: ${errEv.detail}`, 'error');
+    $('go').disabled = $('new').disabled = false; return;
+  }
+  if (!result) { genHide(); setStatus('generation ended with no result', 'error'); $('go').disabled = $('new').disabled = false; return; }
+  let qaMsg = result.qa === 'passed' ? 'vision check: passed'
+    : result.qa?.startsWith('fixed') ? `vision check: ${result.qa.replace('x', '×')}`
+    : '';
+  if (result.print_warnings) qaMsg += ` — ⚠ ${result.print_warnings} floating spot(s), refine to fix or slice with supports`;
+  if (result.backend?.startsWith('local')) qaMsg += ` — ⚠ made by the local fallback model (codex rate-limited): expect crude results until the pool resets`;
+  $('prompt').value = '';
+  clearImage();
+  clearMesh();
+  genHide();
+  await showModel(result, qaMsg);
+  loadLibrary();
   $('go').disabled = $('new').disabled = false;
 }
 $('go').onclick = () => generate(!scad);
@@ -681,6 +891,12 @@ $('send').onclick = async () => {
 
 // --- library ---
 let libCache = [];
+$('copymodelid').onclick = async () => {
+  if (!currentModelId) return;
+  await navigator.clipboard?.writeText(currentModelId);
+  $('copymodelid').textContent = 'Copied';
+  setTimeout(() => { $('copymodelid').textContent = 'Copy ID'; }, 1200);
+};
 async function loadLibrary() {
   libCache = await api('/models', null, 'GET').catch(() => []);
   renderLibrary();
@@ -689,72 +905,82 @@ $('libsearch').oninput = () => renderLibrary();
 function renderLibrary() {
   const q = $('libsearch').value.trim().toLowerCase();
   const models = q
-    ? libCache.filter(m => (m.name + ' ' + (m.prompt ?? '') + ' ' + (m.profile?.name ?? '')).toLowerCase().includes(q))
+    ? libCache.filter(m => (m.name + ' ' + (m.prompt ?? '') + ' ' + (m.profile?.name ?? '') + ' ' + m.id).toLowerCase().includes(q))
     : libCache;
   const lib = $('lib');
   lib.innerHTML = '';
+  const mk = (txt, title, fn) => {  // small library-card button; stops the card's load-onclick
+    const b = document.createElement('button');
+    b.textContent = txt; b.title = title;
+    b.onclick = e => { e.stopPropagation(); fn(b); };
+    return b;
+  };
   for (const m of models) {
     const div = document.createElement('div');
     div.className = 'libitem';
+    div.tabIndex = 0;  // focus-within reveal for keyboard users
     const img = document.createElement('img');
     img.src = `/models/${m.id}/thumb`;
     img.onerror = () => img.removeAttribute('src');
+    // QA badge (overlay on thumbnail)
+    if (m.qa) {
+      const passed = m.qa === 'passed';
+      const qb = document.createElement('span');
+      qb.className = 'qabadge ' + (passed ? 'ok' : 'warn');
+      qb.textContent = passed ? 'QA ✓' : 'QA ⚠';
+      qb.title = passed ? 'vision QA passed' : `vision QA auto-fixed (${m.qa})`;
+      div.appendChild(qb);  // absolute-positioned over the img
+    }
     const row = document.createElement('div');
     row.className = 'row';
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = m.name;
     name.title = (m.prompt ?? '') + `\n🖨 ${m.profile?.name ?? 'unknown/legacy'}`;
-    const up = document.createElement('button');
-    up.textContent = '👍';
+    // rating stays visible (it's card metadata + the rating control)
+    const up = mk('👍', 'like — liked models teach future generations your style',
+      async () => { await api(`/models/${m.id}/rate`, { rating: m.rating === 1 ? 0 : 1 }); loadLibrary(); });
     up.style.opacity = m.rating === 1 ? '1' : '.35';
-    up.onclick = async e => {
-      e.stopPropagation();
-      await api(`/models/${m.id}/rate`, { rating: m.rating === 1 ? 0 : 1 });
-      loadLibrary();
-    };
-    const down = document.createElement('button');
-    down.textContent = '👎';
+    const down = mk('👎', 'dislike',
+      async () => { await api(`/models/${m.id}/rate`, { rating: m.rating === -1 ? 0 : -1 }); loadLibrary(); });
     down.style.opacity = m.rating === -1 ? '1' : '.35';
-    down.onclick = async e => {
-      e.stopPropagation();
-      await api(`/models/${m.id}/rate`, { rating: m.rating === -1 ? 0 : -1 });
-      loadLibrary();
-    };
-    const ren = document.createElement('button');
-    ren.textContent = '✎';
-    ren.onclick = async e => {
-      e.stopPropagation();
+    // rename / duplicate / download / delete / copy — revealed on hover (desktop) or ⋯ tap (touch)
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+    const ren = mk('✎', 'rename', () => {
       const inp = document.createElement('input');
-      inp.type = 'text'; inp.value = m.name; inp.style.cssText = 'width:100%;font-size:11px';
+      inp.type = 'text'; inp.value = m.name; inp.className = 'field';
+      inp.style.cssText = 'width:100%;font-size:11px;padding:2px 4px';
+      inp.onclick = e => e.stopPropagation();
       name.replaceWith(inp); inp.focus();
       inp.onkeydown = async ev => {
         if (ev.key === 'Enter') { await api(`/models/${m.id}`, { name: inp.value }, 'PATCH'); loadLibrary(); }
         if (ev.key === 'Escape') loadLibrary();
       };
-    };
-    const del = document.createElement('button');
-    del.textContent = '🗑';
-    del.onclick = async e => {
-      e.stopPropagation();
-      if (!del.classList.contains('armed')) { del.classList.add('armed'); del.textContent = 'sure?'; return; }
-      await api(`/models/${m.id}`, null, 'DELETE');
-      loadLibrary();
-    };
-    const cp = document.createElement('button');
-    cp.textContent = '📋';
-    cp.title = 'copy prompt';
-    cp.onclick = e => { e.stopPropagation(); navigator.clipboard?.writeText(m.prompt ?? m.name); };
-    const dup = document.createElement('button');
-    dup.textContent = '⧉';
-    dup.title = 'duplicate';
-    dup.onclick = async e => { e.stopPropagation(); await api(`/models/${m.id}/duplicate`, null, 'POST'); loadLibrary(); };
-    const zp = document.createElement('button');
-    zp.textContent = '⬇';
-    zp.title = 'download all files (zip)';
-    zp.onclick = e => { e.stopPropagation(); location.href = `/models/${m.id}/zip`; };
-    row.append(name, up, down, cp, dup, zp, ren, del);
-    div.append(img, row);
+    });
+    const dup = mk('⧉', 'duplicate',
+      async () => { await api(`/models/${m.id}/duplicate`, null, 'POST'); loadLibrary(); });
+    const zp = mk('⬇', 'download all files (zip)', () => { location.href = `/models/${m.id}/zip`; });
+    const cp = mk('📋', 'copy prompt', () => navigator.clipboard?.writeText(m.prompt ?? m.name));
+    const copyId = mk('Copy ID', 'copy public library ID', btn => {
+      navigator.clipboard?.writeText(m.id);
+      btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy ID'; }, 1200);
+    });
+    const del = mk('🗑', 'delete', btn => {
+      if (!btn.classList.contains('armed')) { btn.classList.add('armed'); btn.textContent = 'sure?'; return; }
+      api(`/models/${m.id}`, null, 'DELETE').then(loadLibrary);
+    });
+    acts.append(ren, dup, zp, cp, del);
+    const menu = mk('⋯', 'more actions', () => div.classList.toggle('open'));
+    menu.className = 'menu';
+    row.append(name, up, down, acts, menu);
+    const prof = document.createElement('div');
+    prof.className = 'prof';
+    prof.textContent = `🖨 ${m.profile?.name ?? 'legacy'} · v${m.latest_version ?? 1} · ${String(m.status ?? 'ready').replaceAll('_', ' ')}`;
+    const idline = document.createElement('div'); idline.className = 'idline';
+    const idtext = document.createElement('code'); idtext.textContent = m.id; idtext.title = 'Public library ID';
+    idline.append(idtext, copyId);
+    div.append(img, row, prof, idline);
     div.onclick = async () => {
       setBusyStatus('Loading…');
       try { await showModel(await api(`/models/${m.id}`, null, 'GET'), ''); }
@@ -770,17 +996,20 @@ $('vfit').onclick = () => setCam(1.4, 1.1, 1.4);
 $('vtop').onclick = () => setCam(0, 2.4, 0.001);
 $('vfront').onclick = () => setCam(0, 0.2, 2.4);
 $('vside').onclick = () => setCam(2.4, 0.2, 0);
+const profileBeds = {};
 fetch('/profiles').then(r => r.json()).then(d => {
   const saved = localStorage.getItem('pf_profile');
   for (const p of d.profiles) {
+    profileBeds[p.name] = p.bed_mm;
     const o = document.createElement('option');
     o.value = p.name;
     o.textContent = `🖨 ${p.name}` + (p.multicolor ? ' · AMS' : '');
     o.selected = saved ? p.name === saved : p.name === d.default;
     $('profilesel').appendChild(o);
   }
+  drawBed(profileBeds[$('profilesel').value]);
 }).catch(() => {});
-$('profilesel').onchange = () => localStorage.setItem('pf_profile', $('profilesel').value);
+$('profilesel').onchange = () => { localStorage.setItem('pf_profile', $('profilesel').value); drawBed(profileBeds[$('profilesel').value]); };
 fetch('/presets').then(r => r.json()).then(p => { $('presets').value = p.text; }).catch(() => {});
 let presetsTimer = null;
 $('presets').oninput = () => {
@@ -789,9 +1018,15 @@ $('presets').oninput = () => {
 };
 fetch('/config').then(r => r.json()).then(c => {
   window.bambuddyOn = c.bambuddy;
-  if (c.organic) { $('orgbtn').hidden = false; $('orgsize').hidden = false; }
+  if (c.organic) { $('orgbtn').hidden = false; $('orgsizewrap').hidden = false; }
+  if (c.training_lab) $('traininglab').hidden = false;
 }).catch(() => {});
-loadLibrary();
+loadLibrary().then(async () => {
+  const requested = new URLSearchParams(location.search).get('model');
+  if (!requested) return;
+  try { await showModel(await api(`/models/${requested}`, null, 'GET'), ''); }
+  catch (e) { setStatus(`Model ${requested} is unavailable: ${e.message}`, 'error'); }
+});
 </script>
 </body>
 </html>
