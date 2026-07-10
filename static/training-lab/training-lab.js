@@ -465,7 +465,7 @@ function renderMemory() {
     const detail = document.createElement('p'); detail.textContent = text(rule.recommendation ?? rule.description, 'Recommendation unavailable');
     const confidence = Math.max(0, Math.min(1, finite(rule.confidence) ?? 0));
     const track = document.createElement('div'); track.className = 'confidence-track'; const fill = document.createElement('span'); fill.style.width = `${confidence * 100}%`; track.appendChild(fill);
-    item.append(head, detail, track); item.addEventListener('click', () => showEvidence(title.textContent, rule, 'MEMORY EVIDENCE'));
+    item.append(head, detail, track); item.addEventListener('click', () => showMemoryRule(title.textContent, rule));
     container.appendChild(item);
   }
 }
@@ -498,11 +498,51 @@ function showCandidate(candidate) {
     try { const created = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/branch`); $('evidence-dialog').close(); await initialize(); await loadRun(runId(created)); }
     catch (error) { setConnection(`Branch failed: ${error.message}`, 'error'); }
   });
+  if (candidate.required_checks_passed) {
+    add('Promote → production library', async () => {
+      try { const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/promote-exemplar`);
+            setConnection(`Promoted to production library as ${r.library_model_id} (thumbs-up few-shot)`, 'ok'); }
+      catch (error) { setConnection(`Promote failed: ${error.message}`, 'error'); }
+    });
+    add('Remove from production', async () => {
+      try { const r = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/revoke-exemplar`);
+            setConnection(`Removed ${r.revoked} promoted exemplar(s) from production`, 'ok'); }
+      catch (error) { setConnection(`Revoke failed: ${error.message}`, 'error'); }
+    });
+  }
   add('Delete candidate', async () => {
     if (!confirm('Delete this isolated candidate and its artifacts? Protected or parent candidates cannot be deleted.')) return;
     try { await api(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}`, { method: 'DELETE' }); $('evidence-dialog').close(); await loadRun(runId(state.run)); }
     catch (error) { setConnection(`Delete failed: ${error.message}`, 'error'); }
   }, true);
+  body.appendChild(actions);
+}
+
+function showMemoryRule(title, rule) {
+  showEvidence(title, rule, 'MEMORY EVIDENCE');
+  const body = $('evidence-body');
+  const rid = rule.id ?? rule.rule_id;
+  const actions = document.createElement('div'); actions.className = 'candidate-actions';
+  const add = (label, handler, danger = false) => {
+    const button = document.createElement('button'); button.type = 'button';
+    button.className = `button ${danger ? 'danger' : 'secondary'}`; button.textContent = label;
+    button.onclick = handler; actions.appendChild(button);
+  };
+  // The backend enforces the validated/high-confidence gate (using derived status), so we always
+  // offer promote and surface its 409 reason rather than duplicating the confidence logic here.
+  add('Promote rule → production prompt', async () => {
+    try { await postJSON(`/training-lab/api/memory/${encodeURIComponent(rid)}/promote-rule`);
+          setConnection('Rule promoted into the production generation prompt', 'ok'); }
+    catch (error) { setConnection(`Promote failed: ${error.message}`, 'error'); }
+  });
+  add('Remove rule from production', async () => {
+    try { const r = await postJSON(`/training-lab/api/memory/${encodeURIComponent(rid)}/revoke-rule`);
+          setConnection(`Removed ${r.revoked} rule(s) from production`, 'ok'); }
+    catch (error) { setConnection(`Revoke failed: ${error.message}`, 'error'); }
+  }, true);
+  const note = document.createElement('p'); note.className = 'muted';
+  note.textContent = 'Only validated or high-confidence rules can be promoted; production reads promoted rules into every generation.';
+  actions.appendChild(note);
   body.appendChild(actions);
 }
 
