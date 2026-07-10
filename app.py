@@ -569,6 +569,106 @@ def save_to_library(prompt: str, scad: str, stl: Path, intent: list[str],
     return model_id
 
 
+# --- Training Lab -> production promotion (human-gated feedback loop) ---
+# The evolution lab is isolated by design; these are the ONLY paths lab output reaches
+# production, and only via explicit human approval (wired as EvolutionAdapters callables so
+# evolution_lab never imports app and its store never writes to library/ itself).
+PROMOTED_RULES_FILE = LIB_DIR / "promoted_rules.json"
+
+
+def _load_promoted_rules() -> list[dict]:
+    try:
+        return json.loads(PROMOTED_RULES_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def promoted_rules_block(prompt: str = "") -> str:
+    """Design rules promoted from the evolution Training Lab (human-approved, validated across
+    multiple models). Injected into production generation so lab-learned lessons shape output.
+    Disable instantly with PRINT_FORGE_PROMOTED_RULES=0."""
+    if os.environ.get("PRINT_FORGE_PROMOTED_RULES", "1") == "0":
+        return ""
+    rules = _load_promoted_rules()
+    if not rules:
+        return ""
+    lines = "\n".join(
+        f"- {r['recommendation']}" + (f" (when {r['trigger_conditions']})" if r.get("trigger_conditions") else "")
+        for r in rules if r.get("recommendation"))
+    if not lines:
+        return ""
+    return ("\n\nVALIDATED DESIGN RULES — lessons promoted from PrintForge's evolution lab, "
+            "confirmed across multiple models. Apply any that fit this request:\n" + lines + "\n")
+
+
+def promote_exemplar_to_library(scad: str, name: str, prompt: str, score, candidate_id: str) -> str:
+    """Promote a Training Lab winning candidate into the production library as a thumbs-up
+    few-shot exemplar (consumed by _taste_example). Reversible: it is a normal rated model."""
+    model_id = uuid.uuid4().hex[:12]
+    mdir = LIB_DIR / model_id
+    mdir.mkdir()
+    (mdir / "model.scad").write_text(scad)
+    (mdir / "meta.json").write_text(json.dumps({
+        "id": model_id,
+        "name": (name or prompt).strip()[:60],
+        "prompt": prompt,
+        "rating": 1,
+        "source": "evolution-lab",
+        "source_candidate_id": candidate_id,
+        "score": score,
+        "created": time.time(),
+        "promoted_at": time.time(),
+    }))
+    try:
+        job = WORK_DIR / f"promote-{model_id}.scad"
+        job.write_text(scad)
+        render_png(job, mdir / "thumb.png", imgsize="400,300")
+    except Exception:
+        pass
+    return model_id
+
+
+def revoke_exemplar_from_library(candidate_id: str) -> int:
+    """Remove any library exemplars that were promoted from a given lab candidate."""
+    removed = 0
+    for mdir in LIB_DIR.iterdir():
+        mf = mdir / "meta.json"
+        if not mf.exists():
+            continue
+        try:
+            meta = json.loads(mf.read_text())
+        except ValueError:
+            continue
+        if meta.get("source") == "evolution-lab" and meta.get("source_candidate_id") == candidate_id:
+            shutil.rmtree(mdir, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def promote_rule_to_production(rule: dict) -> dict:
+    """Append (or replace) a validated lab memory rule in the production promoted-rules file."""
+    rid = rule.get("id") or rule.get("rule_id")
+    rules = [r for r in _load_promoted_rules() if r.get("id") != rid]
+    entry = {
+        "id": rid,
+        "recommendation": rule.get("recommendation", ""),
+        "trigger_conditions": rule.get("trigger_conditions", ""),
+        "scope": rule.get("scope", {}),
+        "source": "evolution-lab",
+        "promoted_at": time.time(),
+    }
+    rules.append(entry)
+    PROMOTED_RULES_FILE.write_text(json.dumps(rules, indent=2))
+    return entry
+
+
+def revoke_rule_from_production(rule_id: str) -> int:
+    rules = _load_promoted_rules()
+    kept = [r for r in rules if r.get("id") != rule_id]
+    PROMOTED_RULES_FILE.write_text(json.dumps(kept, indent=2))
+    return len(rules) - len(kept)
+
+
 def intent_block(intent: list[str]) -> str:
     if not intent:
         return ""
@@ -1093,7 +1193,7 @@ async def _run_generate(req: GenerateRequest, emit):
                 )
         except Exception:
             pass
-        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + prof_note + presets_block() + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
+        instruction = SYSTEM_PROMPT + archetype_notes(req.prompt) + prof_note + presets_block() + promoted_rules_block(req.prompt) + "\n\n" + (f"{mesh_note}\n\n" if mesh_note else "") + (
             intent_block(load_intent(req.parent_id)) +
             rules_block(load_rules(req.parent_id)) +
             part_state_block(load_part_state(req.parent_id)) +
@@ -1129,6 +1229,7 @@ async def _run_generate(req: GenerateRequest, emit):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + archetype_notes(req.prompt)
                                           + prof_note + presets_block()
+                                          + promoted_rules_block(req.prompt)
                                           + _taste_example(req.prompt)},
             {"role": "user", "content": user_prompt(req.prompt, req.current_scad, mesh_note)},
         ]
@@ -1984,6 +2085,10 @@ app.include_router(create_router(
         generate_candidate=_lab_generate_candidate,
         evaluate_candidate=_lab_evaluate_candidate,
         current_branch=_lab_current_branch,
+        promote_exemplar=promote_exemplar_to_library,
+        revoke_exemplar=revoke_exemplar_from_library,
+        promote_rule=promote_rule_to_production,
+        revoke_rule=revoke_rule_from_production,
     ),
     production_branch="main",
 ))

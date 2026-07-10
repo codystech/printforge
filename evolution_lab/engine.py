@@ -29,6 +29,11 @@ class EvolutionAdapters:
     generate_candidate: Callable[[str, dict[str, Any]], dict[str, Any] | str] | None = None
     evaluate_candidate: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
     current_branch: Callable[[], str] | None = None
+    # Human-gated promotion into production (injected by app.py; the lab store never writes there).
+    promote_exemplar: Callable[..., str] | None = None
+    revoke_exemplar: Callable[[str], int] | None = None
+    promote_rule: Callable[[dict], dict] | None = None
+    revoke_rule: Callable[[str], int] | None = None
 
 
 def _dump(value: Any) -> dict:

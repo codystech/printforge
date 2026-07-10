@@ -14,6 +14,7 @@ from .config import EvolutionLabConfig
 from .datasets import create_export
 from .demo import DEMO_RUN_ID, load_demo_fixture
 from .engine import EvolutionAdapters, EvolutionEngine
+from .memory import derive_status
 from .schemas import (
     BenchmarkInput, CalibrationInput, CreateRunRequest, DatasetExportInput,
     MemoryObservationInput, MemoryReviewInput, MemoryRuleInput,
@@ -210,6 +211,33 @@ def create_router(
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @router.post("/candidates/{candidate_id}/promote-exemplar")
+    async def promote_exemplar(candidate_id: str):
+        """Human-gated: promote a checks-passing candidate into the production library as a
+        thumbs-up few-shot exemplar. Crosses the lab->production boundary on explicit request only."""
+        run_id, record = find_candidate(candidate_id)
+        db, _ = require_lab()
+        if adapters.promote_exemplar is None:
+            raise HTTPException(501, "promotion to production is not wired on this deployment")
+        if not record.get("required_checks_passed"):
+            raise HTTPException(409, "candidate has not passed required checks; not eligible for promotion")
+        try:
+            scad = store.candidate_artifact(run_id, candidate_id, "model.scad").read_text()  # type: ignore[union-attr]
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(404, "candidate has no model.scad to promote") from exc
+        run = db.get_run(run_id)
+        spec = run.get("validated_spec") or run.get("source_prompt") or "evolution lab exemplar"
+        score = record.get("score", {}).get("total") if isinstance(record.get("score"), dict) else record.get("score")
+        model_id = adapters.promote_exemplar(scad, run.get("title") or spec, spec, score, candidate_id)
+        return {"promoted": True, "library_model_id": model_id, "candidate_id": candidate_id}
+
+    @router.post("/candidates/{candidate_id}/revoke-exemplar")
+    async def revoke_exemplar(candidate_id: str):
+        find_candidate(candidate_id)
+        if adapters.revoke_exemplar is None:
+            raise HTTPException(501, "promotion to production is not wired on this deployment")
+        return {"revoked": adapters.revoke_exemplar(candidate_id)}
+
     @router.get("/memory")
     async def list_memory():
         db, _ = require_lab()
@@ -233,6 +261,31 @@ def create_router(
     async def review_memory(rule_id: str, request: MemoryReviewInput):
         _, lab = require_lab()
         return lab.memory.review(rule_id, request.action, request.note)
+
+    @router.post("/memory/{rule_id}/promote-rule")
+    async def promote_rule(rule_id: str):
+        """Human-gated: inject a validated/high-confidence lab design rule into the production
+        generation prompt. Only rules that cleared the confidence bar are eligible."""
+        db, _ = require_lab()
+        safe_id(rule_id, "rule id")
+        if adapters.promote_rule is None:
+            raise HTTPException(501, "promotion to production is not wired on this deployment")
+        try:
+            rule = db.get_record("memory", rule_id)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(404, "memory rule not found") from exc
+        status = derive_status(rule)
+        if status not in {"validated", "high-confidence"}:
+            raise HTTPException(409, f"rule status is '{status}'; only validated or high-confidence rules can be promoted")
+        return {"promoted": True, "rule": adapters.promote_rule(rule)}
+
+    @router.post("/memory/{rule_id}/revoke-rule")
+    async def revoke_rule(rule_id: str):
+        require_lab()
+        safe_id(rule_id, "rule id")
+        if adapters.revoke_rule is None:
+            raise HTTPException(501, "promotion to production is not wired on this deployment")
+        return {"revoked": adapters.revoke_rule(rule_id)}
 
     @router.post("/physical-validations")
     async def physical_validation(request: PhysicalValidationInput):
