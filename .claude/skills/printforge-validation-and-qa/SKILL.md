@@ -76,7 +76,10 @@ Library hygiene: validation generations must use a `test: ` name prefix or be de
 
 ## Test Discipline
 
-The only unit test as of 2026-07-06 is the assert-based `parts.py` `__main__` self-check. It creates two disjoint cubes in a tempdir, verifies `split_parts` returns `["part_1", "part_2"]`, writes a 3MF, reads `3D/3dmodel.model`, and asserts two objects plus a build element.
+The core geometry self-check remains the assert-based `parts.py` `__main__`
+check. The experimental Training Lab also has isolated `unittest` coverage under
+`tests/`; those tests use temporary stores and fake generation/evaluation
+adapters, never model quota, `library/`, or `uploads/`.
 
 Run it from the repo:
 
@@ -89,6 +92,16 @@ Expected output:
 
 ```text
 parts.py self-check OK
+```
+
+Run the Training Lab contract suite with the existing dependency environment:
+
+```sh
+UV_CACHE_DIR=/tmp/printforge-uv-cache uv run --offline \
+  --with fastapi --with httpx --with trimesh --with numpy --with scipy \
+  --with python-multipart --with networkx --with lxml --with shapely \
+  --with rtree --with manifold3d --with cascadio \
+  python -m unittest discover -s tests -v
 ```
 
 Sandbox note from this authoring pass: the exact command first failed here because `uv` tried to initialize `/home/cody/.cache/uv` on a read-only filesystem. The same self-check passed with `UV_CACHE_DIR=/tmp/printforge-uv-cache` prepended. If your environment is writable, use the plain command above; if it fails with `Failed to initialize cache`, re-run with:

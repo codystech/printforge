@@ -21,7 +21,7 @@ description: >
 
 PrintForge is a LIVE self-hosted service (systemd user unit `printforge`, port 8093, binds
 `0.0.0.0`) used over the LAN by a second real person — "the collaborator." There is no CI,
-no staging, no test suite except `parts.py`'s `__main__` self-check. The filesystem IS the
+no staging, a geometry self-check plus an isolated Training Lab unittest suite. The filesystem IS the
 database. That means **every edit you make ships to a real user the moment you restart the
 service, and there is no safety net but this document.** Read the change class, do the
 required validation, follow the deploy protocol, update the docs of record. In that order.
@@ -222,13 +222,17 @@ curl -s http://localhost:8093/config      # → {"bambuddy":true,"organic":true}
   list of what is intentionally deferred or rejected. **Do not re-propose retired ideas as
   new work.** Retired (do not resurrect): **thin-wall analysis** (the slicer does it
   better), **AMF export** (dead format), **fake STEP export** (dishonest for a mesh-only
-  pipeline), scale/rotate/center helpers (slicer's job), **cancel buttons for
-  generation** (`codex exec` is not cancellable), and **format/QA library filters**
+  pipeline), scale/rotate/center helpers (slicer's job), and **format/QA library filters**
   (search suffices; this one is absent from README's list but is settled — see
   printforge-failure-archaeology). Still-deferred (fine to pick up with
-  sign-off): Sparc3D/TRELLIS.2 organic-backend evaluation, thumbs-down negative examples,
+  sign-off): Sparc3D/TRELLIS.2 organic-backend evaluation,
   Bambu paint-color metadata, text→image→3D chaining, CT/NPM/Authelia deploy, in-UI custom
   profile editor.
+
+  Immediate cancellation is supported only by the isolated Training Lab: its
+  Codex/OpenSCAD subprocesses run in dedicated process groups and the
+  interrupted candidate remains persisted. This does not make the production
+  `/generate` SSE path cancellable.
 
 ---
 

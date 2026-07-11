@@ -38,10 +38,13 @@ Ground truth: `app.py` (~1491 lines), `prompts.py`, `parts.py`, `organic/`,
 
 PrintForge is one FastAPI app (`app.py`) serving a vanilla-JS single-page app
 (`static/index.html`, mounted at `/`). No database: the filesystem is the store.
-Two persistence roots plus one scratch root:
+Three persistence roots plus one scratch root:
 
 - `library/<12-hex-id>/{model.scad, meta.json, thumb.png}` — saved models (USER DATA).
 - `uploads/<12-hex-id>.{stl,json[,step,svg]}` — imported/traced base meshes.
+- `training_lab_data/` — feature-gated evolution runs, immutable candidate
+  artifacts, checkpoints, lineage and events. It never writes candidates into
+  `library/` automatically.
 - `WORK_DIR = /tmp/printforge` — every render, PNG, codex job, export. Ephemeral;
   wiped on reboot. `stl_id` is a 32-hex handle into here (distinct from the 12-hex
   library id).
@@ -89,6 +92,30 @@ POST /generate {prompt, current_scad?, image?, mesh_ids?, parent_id?, profile?}
 Both paths converge on: render-to-validate → optional QA → save → report → return.
 The response carries `scad` + parsed `params` so the UI can build sliders
 immediately.
+
+### /training-lab/api/runs — bounded evolution pipeline
+
+Training Lab runs have two compatible modes. `evolve_existing` requires a safe
+12-character Library ID and copies that model into isolated generation zero.
+`create_from_spec` requires no source model: Start generates generation zero
+from the validated specification, profile and locked requirements, then runs
+the same deterministic evaluation before any refinement iteration.
+
+Every attempt is created as a candidate record before backend work begins. Its
+SCAD/artifacts, evidence, score, prompt, failure reason, timestamps and lineage
+are stored separately; failed or cancelled generation-zero attempts remain
+inspectable. Later iterations produce A/B children of the immutable current
+best and only checkpoint a replacement when it improves the best without a hard
+rejection. Restore and branch create new checkpoints/runs; they never overwrite
+an artifact. Explicit deletion is blocked for generation zero, baselines,
+current best candidates, and candidates with descendants.
+
+The loop is bounded by iteration count, runtime, backend calls/cost, repeated
+generation failures, no improvement, optional quality target, required checks,
+graceful stop, or immediate cancellation. Lab Codex calls use their own process
+group so cancellation can terminate the subprocess while retaining the partial
+candidate record. Legacy requests without `run_mode` still mean
+`evolve_existing`; `source_model_id` is nullable only for `create_from_spec`.
 
 ### /render — slider re-render (app.py:1149)
 
@@ -259,6 +286,8 @@ raises rather than silently degrade.
 | I10 | Organic generation holds `_organic_lock` for its whole run and frees the GPU first — never two GPU jobs at once. | app.py:1290 |
 | I11 | `profile` is snapshotted into meta as a full dict, not a name reference. | app.py:1128 |
 | I12 | Deterministic checks (floating_starts, lock_violations, /validate booleans) gate; the vision LLM only advises. | parts.py:67; app.py:499; app.py:1462 |
+| I13 | Evolution candidates are versioned under `training_lab_data/`, never overwrite the current best, and every run has explicit finite stop controls. | evolution_lab/engine.py; evolution_lab/store.py |
+| I14 | `source_model_id` is required for `evolve_existing`, nullable for `create_from_spec`, and omitted `run_mode` remains backward-compatible. | evolution_lab/schemas.py; evolution_lab/engine.py |
 
 If a change would break any of these, it is a structural change — take it through
 **printforge-change-control** with evidence per **printforge-validation-and-qa**.

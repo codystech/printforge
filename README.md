@@ -51,8 +51,9 @@ straight to the Bambuddy archive.
   parameter changes vs the parent version
 - Refines run through codex's file-editing tools (no full-file rewrites) and
   inherit design intent — every accepted change is preserved as law
-- 👍/👎 taste training: liked models are retrieved as few-shot examples for
-  similar future prompts
+- 👍/👎 taste training: for a similar future prompt, the best-matching liked
+  model is retrieved as a few-shot example to emulate and the best-matching
+  disliked model as a counter-example to avoid
 
 **Assembly (v1 + Parts Panel v2)**
 - Every part gets an `_enabled` toggle + `assembled_preview` mode
@@ -72,6 +73,54 @@ straight to the Bambuddy archive.
   (incl. printer profile), rename, duplicate, delete, download-as-ZIP,
   copy-prompt, lineage (parent links), per-model rules, part states, QA
   outcome, backend and printer-profile snapshot in metadata
+- Every Library card and loaded-model panel shows the safe 12-character public
+  model ID with a Copy ID action; `/?model=<id>` opens that model directly
+
+**Evolution Training Lab (experimental, disabled by default)**
+- `/training-lab/` is an isolated runtime-evolution workspace; it never replaces
+  the normal Generate workflow and never writes candidates into `library/`
+- Two controlled candidates share one baseline, specification, profile, locks,
+  reference roles and export exclusions; evidence scoring selects a winner only
+  when it beats the immutable current best
+- Each candidate's mutation outcome is retained in the isolated lab store;
+  later generations and runs safely balance exploring unused strategies with
+  favoring mutation types that previously won or improved the score. Failed,
+  cancelled, hard-rejected or otherwise ineligible attempts never receive
+  positive learning credit, even when their raw numeric score increased.
+- Adaptive reuse is exact-scope only: existing-model runs match the same source
+  model ID, while specification-created runs match a normalized-spec digest;
+  both also require the same profile name, printer, nozzle, layer height and
+  material. Legacy unscoped audit files remain untouched but do not influence
+  scoped selection. An atomically maintained recent-outcome manifest retains at
+  most 1,000 IDs; each selection reads only manifest-referenced files and uses at
+  most 200 matching outcomes, never a lifetime directory scan.
+- New runs can either select an existing Library model through a searchable
+  name/thumbnail/ID/version/status picker or create generation zero directly
+  from a design specification; legacy source-model requests remain compatible
+- Iteration count, runtime, repeated failures, no-improvement streak and an
+  optional quality target are explicit bounded stop controls (defaults: 5
+  iterations, 20 minutes, 3 failures and 2 no-improvement iterations)
+- Every generation-zero attempt and A/B candidate is independently persisted
+  with prompt, score, validation evidence, failure reason, timestamps and
+  lineage. Candidates can be inspected, compared, restored, branched or
+  explicitly deleted; baselines and the current best are protected
+- Live run state reports iteration, stage, best score, latest failure and
+  elapsed time. Immediate cancellation terminates the isolated lab Codex
+  process group, keeps the interrupted candidate for diagnosis and records its
+  cancelled mutation outcome with no positive learning credit. Any candidate
+  completed earlier in that interrupted A/B generation is also retained as a
+  non-winning audited outcome.
+- Atomic filesystem state under gitignored `training_lab_data/` preserves runs,
+  candidates, rejected variants, evidence, events, checkpoints, scoped memory,
+  calibration/physical feedback, benchmark results and promotion proposals
+- The page visualizes persisted pipeline state, synchronized A/B previews,
+  rewards, issues, mutations, lineage, memory, score progression and event logs;
+  its seeded SIX SEVEN example is permanently labeled demo data
+- Dataset exports produce redacted JSON, JSONL, CSV or ZIP preference, repair,
+  calibration, supervised and failure examples. This prepares data; it does not
+  change neural-network weights.
+- Actual fine-tuning is not implemented for the current backends. The training
+  endpoint reports unsupported and cannot deploy or merge anything.
 
 ## Run (primary — host, codex backend)
 
@@ -96,6 +145,37 @@ No codex inside the container: generation uses the local LiteLLM/qwen brain
 `LLM_BACKEND` (`codex`/`http`), `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`,
 `OPENSCAD_ARGS`.
 
+Experimental flags all default to `false` and are read at startup:
+
+| Variable | Purpose |
+|---|---|
+| `PRINT_FORGE_EVOLUTION_ENABLED` | permits explicit A/B evolution jobs |
+| `PRINT_FORGE_TRAINING_LAB_ENABLED` | enables the isolated API/page and demo history |
+| `PRINT_FORGE_MEMORY_LEARNING_ENABLED` | permits scoped memory updates/application |
+| `PRINT_FORGE_PHYSICAL_FEEDBACK_ENABLED` | permits physical and calibration records |
+| `PRINT_FORGE_ACTUAL_TRAINING_ENABLED` | outer gate for a future supported training provider |
+| `PRINT_FORGE_TRAINING_ENABLED` | future training-job gate; no provider exists today |
+| `PRINT_FORGE_LAB_ONLY` | blocks non-Training-Lab mutations on the isolated test service |
+
+Future training configuration is inert today: `PRINT_FORGE_TRAINING_BACKEND`,
+`PRINT_FORGE_TRAINING_DATASET`, `PRINT_FORGE_BASE_MODEL`,
+`PRINT_FORGE_TRAINED_MODEL_PATH`, `PRINT_FORGE_TRAINED_MODEL_VERSION`, and
+`PRINT_FORGE_TRAINED_MODEL_APPROVED`. Enabling flags does not merge branches,
+activate learned production rules, or perform model-weight training.
+
+### Isolated Training Lab test service
+
+`printforge-training-lab.service` runs the current experimental branch at
+`http://localhost:8094` (redirecting to `/training-lab/`). It listens on
+`0.0.0.0:8094` so a source-limited host firewall can make it available to
+trusted LAN clients; on Cody's main PC that URL is
+`http://192.168.1.77:8094/training-lab/`. It enables the
+runtime-evolution/memory/physical-feedback lab flags, keeps actual model training
+disabled, and sets `PRINT_FORGE_LAB_ONLY=true`. In lab-only mode, non-lab writes
+such as `/generate`, uploads, ratings, profile edits, and model deletion return
+HTTP 403; production on port 8093 is unaffected. The Training Lab has no login,
+so network access should remain restricted to trusted source networks.
+
 ## How it works
 
 - `POST /generate` — prompt (+ current .scad when refining, + optional image
@@ -119,7 +199,6 @@ phone stand into an LED sign.
 
 - Deploy to a lab CT behind NPM/Authelia once it proves useful.
 - Sparc3D/TRELLIS.2 evaluation as alternative organic backends.
-- Thumbs-down models as explicit negative examples.
 - Bambu-native paint-color metadata (basematerials support unconfirmed).
 - Text-only figurines (local image gen chained into Hunyuan3D).
 - In-UI custom printer-profile editor (API-only today).

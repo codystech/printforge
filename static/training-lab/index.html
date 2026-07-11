@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Training Lab · PrintForge</title>
+  <link rel="stylesheet" href="/vendor/tokens.css">
+  <link rel="stylesheet" href="/training-lab/training-lab.css">
+</head>
+<body>
+  <div class="ambient-grid" aria-hidden="true"></div>
+  <div id="demo-banner" class="demo-banner" hidden>DEMO DATA — NOT A REAL TRAINING RUN</div>
+
+  <header class="lab-header">
+    <div class="brand-block">
+      <a class="back-link" href="/" aria-label="Back to PrintForge">← PrintForge</a>
+      <div>
+        <p class="eyebrow">CONTROLLED EVOLUTION ENVIRONMENT</p>
+        <h1>Training <span>Lab</span></h1>
+      </div>
+    </div>
+    <div class="header-status" aria-label="Run status">
+      <div><span>Branch</span><strong id="current-branch">Unavailable</strong></div>
+      <div><span>Production</span><strong id="production-branch">Unavailable</strong></div>
+      <div><span>Run</span><strong id="run-status" class="status-label neutral">Loading</strong></div>
+      <div><span>Generation</span><strong id="generation-label">—</strong></div>
+      <div><span>Stage</span><strong id="stage-label">—</strong></div>
+      <div><span>Best</span><strong id="best-score">—</strong></div>
+      <div><span>Elapsed</span><strong id="elapsed-label">—</strong></div>
+      <div><span>Latest failure</span><strong id="failure-label">—</strong></div>
+    </div>
+    <div class="header-actions">
+      <select id="run-select" class="field" aria-label="Evolution run"><option value="">Select run…</option></select>
+      <button id="new-run" class="button" type="button">New run</button>
+      <button id="resume-run" class="button secondary" type="button" hidden>Resume</button>
+      <button id="stop-run" class="button secondary" type="button" hidden>Stop after generation</button>
+      <button id="cancel-run" class="button danger" type="button" hidden>Cancel now</button>
+      <button id="export-run" class="button secondary" type="button" hidden>Export</button>
+      <button id="open-benchmarks" class="button secondary" type="button">Benchmarks</button>
+      <button id="refresh-run" class="button secondary" type="button">Refresh</button>
+      <button id="open-demo" class="button secondary" type="button" hidden>Open demo</button>
+    </div>
+  </header>
+
+  <main id="lab-app" class="lab-shell" aria-busy="true">
+    <section id="disabled-state" class="state-screen" hidden>
+      <div class="state-icon" aria-hidden="true">◇</div>
+      <p class="eyebrow">FEATURE GATED</p>
+      <h2>Training Lab is disabled</h2>
+      <p>Normal PrintForge remains unchanged. Enable the Training Lab flag on the experimental branch to inspect persisted runs.</p>
+      <div id="flag-list" class="flag-list"></div>
+      <a class="button secondary" href="/">Return to Generate</a>
+    </section>
+
+    <section id="empty-state" class="state-screen" hidden>
+      <div class="state-icon" aria-hidden="true">⌁</div>
+      <p class="eyebrow">NO RUN SELECTED</p>
+      <h2>No evolution history yet</h2>
+      <p>Create an evolution run from an enabled backend, or open the isolated demo dataset when available.</p>
+    </section>
+
+    <div id="workspace" class="workspace" hidden>
+      <aside class="left-rail stack">
+        <section class="panel pipeline-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">LIVE STATE</p><h2>Pipeline</h2></div>
+            <span id="pipeline-updated" class="muted">—</span>
+          </div>
+          <ol id="pipeline" class="pipeline" aria-label="Evolution pipeline"></ol>
+        </section>
+
+        <section class="panel constraints-panel">
+          <div class="panel-heading"><div><p class="eyebrow">HARD BOUNDARY</p><h2>Constraints</h2></div></div>
+          <div id="constraints" class="constraint-list"></div>
+        </section>
+      </aside>
+
+      <section class="center-stage stack">
+        <section class="panel comparison-panel">
+          <div class="panel-heading comparison-heading">
+            <div><p class="eyebrow">CURRENT GENERATION</p><h2>A/B Comparison</h2></div>
+            <div class="viewer-actions" role="group" aria-label="Viewer controls">
+              <label class="toggle"><input id="sync-camera" type="checkbox" checked><span>Synchronized cameras</span></label>
+              <button class="mini-button" data-view="iso" type="button">Iso</button>
+              <button class="mini-button" data-view="top" type="button">Top</button>
+              <button class="mini-button" data-view="front" type="button">Front</button>
+              <button class="mini-button" data-view="side" type="button">Side</button>
+              <button id="fit-viewers" class="mini-button" type="button">Fit</button>
+            </div>
+          </div>
+          <div class="viewer-grid">
+            <article id="candidate-card-a" class="candidate-card" aria-label="Variant A">
+              <div class="candidate-head"><div><span class="variant-mark a">A</span><strong id="candidate-name-a">Waiting for Variant A</strong></div><span id="candidate-state-a" class="status-label neutral">Waiting</span></div>
+              <div id="viewer-a" class="model-viewport"><div class="viewer-placeholder">Select a candidate with a persisted preview</div></div>
+              <img id="mobile-thumb-a" class="mobile-thumb" alt="Variant A preview" hidden>
+              <div id="candidate-meta-a" class="candidate-meta"></div>
+            </article>
+            <article id="candidate-card-b" class="candidate-card" aria-label="Variant B">
+              <div class="candidate-head"><div><span class="variant-mark b">B</span><strong id="candidate-name-b">Waiting for Variant B</strong></div><span id="candidate-state-b" class="status-label neutral">Waiting</span></div>
+              <div id="viewer-b" class="model-viewport"><div class="viewer-placeholder">Select a candidate with a persisted preview</div></div>
+              <img id="mobile-thumb-b" class="mobile-thumb" alt="Variant B preview" hidden>
+              <div id="candidate-meta-b" class="candidate-meta"></div>
+            </article>
+          </div>
+          <div class="viewer-layers" aria-label="Viewer layers">
+            <label><input type="checkbox" data-layer="reference" checked> Reference</label>
+            <label><input type="checkbox" data-layer="negative"> Negative space</label>
+            <label><input type="checkbox" data-layer="issues" checked> Issue markers</label>
+            <label><input type="checkbox" data-layer="wireframe"> Wireframe</label>
+          </div>
+        </section>
+
+        <section class="panel difference-panel">
+          <div class="panel-heading"><div><p class="eyebrow">EXACT RECORDED CHANGES</p><h2>Mutation &amp; Difference Inspector</h2></div><span class="status-label neutral">Parameter and QA comparison</span></div>
+          <div id="mutation-compare" class="mutation-grid"></div>
+        </section>
+      </section>
+
+      <aside class="right-rail stack">
+        <section class="panel reward-panel">
+          <div class="panel-heading"><div><p class="eyebrow">EVIDENCE WEIGHTED</p><h2>Reward</h2></div><span id="reward-confidence" class="confidence">—</span></div>
+          <div id="reward-totals" class="reward-totals"></div>
+          <div id="reward-breakdown" class="reward-breakdown"></div>
+        </section>
+
+        <section class="panel issues-panel">
+          <div class="panel-heading"><div><p class="eyebrow">RED TEAM</p><h2>Issues</h2></div><span id="issue-count" class="count-badge">0</span></div>
+          <div id="issues" class="issue-list"></div>
+        </section>
+
+        <section class="panel memory-panel">
+          <div class="panel-heading"><div><p class="eyebrow">SCOPED LEARNING</p><h2>Memory</h2></div></div>
+          <div id="memory" class="memory-list"></div>
+        </section>
+      </aside>
+
+      <section class="panel lineage-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">AUDIT HISTORY</p><h2>Lineage</h2></div>
+          <div class="graph-actions"><button id="lineage-fit" class="mini-button" type="button">Fit graph</button><label class="toggle"><input id="show-rejected" type="checkbox" checked><span>Rejected</span></label></div>
+        </div>
+        <div id="lineage" class="lineage" aria-label="Candidate lineage graph"></div>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-heading"><div><p class="eyebrow">BEST NEVER REGRESSES</p><h2>Score Progression</h2></div></div>
+        <svg id="score-chart" class="score-chart" role="img" aria-label="Evolution score progression"></svg>
+        <div id="score-chart-summary" class="sr-only"></div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">PERSISTED EVENTS</p><h2>Event Log</h2></div>
+          <select id="log-filter" class="field small" aria-label="Log severity"><option value="all">All severity</option><option value="info">Info</option><option value="warning">Warnings</option><option value="error">Errors</option></select>
+        </div>
+        <div id="event-log" class="event-log" role="log" aria-live="polite"></div>
+      </section>
+
+      <section class="panel summary-panel">
+        <div class="panel-heading"><div><p class="eyebrow">RUN OUTCOME</p><h2>Summary</h2></div></div>
+        <dl id="run-summary" class="summary-grid"></dl>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="evidence-dialog" class="evidence-dialog">
+    <form method="dialog"><button class="dialog-close" aria-label="Close evidence">×</button></form>
+    <p id="evidence-kicker" class="eyebrow">EVIDENCE</p>
+    <h2 id="evidence-title">Evidence</h2>
+    <div id="evidence-body" class="evidence-body"></div>
+  </dialog>
+
+  <dialog id="new-run-dialog" class="evidence-dialog">
+    <form id="new-run-form">
+      <button class="dialog-close" type="button" data-close-new-run aria-label="Close new run">×</button>
+      <p class="eyebrow">EXPLICIT EXPERIMENT</p>
+      <h2>New Evolution Run</h2>
+      <fieldset class="mode-picker">
+        <legend>Run mode</legend>
+        <label><input type="radio" name="run-mode" value="evolve_existing" checked><span><strong>Evolve existing model</strong><small>Use a Library model as generation zero.</small></span></label>
+        <label><input type="radio" name="run-mode" value="create_from_spec"><span><strong>Create from specification</strong><small>Generate, validate, and refine a new generation zero.</small></span></label>
+      </fieldset>
+
+      <section id="starting-model-section" class="form-section">
+        <div class="form-row"><span>Starting model</span><input id="model-search" class="field" type="search" placeholder="Search model name or ID…" autocomplete="off"></div>
+        <div id="selected-model" class="selected-model" aria-live="polite">Select a Library model.</div>
+        <div id="model-picker-results" class="model-picker-results"></div>
+        <label class="toggle advanced-toggle"><input id="paste-id-toggle" type="checkbox"><span>Paste ID instead</span></label>
+        <div id="paste-id-row" class="paste-id-row" hidden><input id="new-source-id" class="field" maxlength="12" pattern="[0-9a-f]{12}" placeholder="12-character library ID"><button id="validate-pasted-id" class="button secondary" type="button">Validate ID</button></div>
+        <p id="model-picker-error" class="field-error" role="alert"></p>
+      </section>
+
+      <details class="form-collapse" open><summary>Design specification</summary>
+        <label class="form-row">Describe required geometry, dimensions, behavior, and success criteria<textarea id="new-spec" class="field" required rows="6" placeholder="Describe required geometry, dimensions, behavior, and success criteria"></textarea></label>
+      </details>
+
+      <details class="form-collapse" open><summary>Printer profile</summary>
+        <label class="form-row">Printer profile<select id="new-profile" class="field" required><option value="">Loading printer profiles…</option></select></label>
+      </details>
+
+      <details class="form-collapse" open><summary>Locked requirements</summary>
+        <div class="req-toolbar">
+          <select id="req-preset" class="field small" aria-label="Requirement preset"></select>
+          <button id="req-extract-btn" class="mini-button" type="button">Extract requirements from specification</button>
+          <button id="req-add" class="mini-button" type="button">Add requirement</button>
+        </div>
+        <div class="req-head" aria-hidden="true"><span>Category</span><span>Requirement</span><span>Value</span><span>Severity</span><span></span></div>
+        <div id="req-editor" class="req-editor"></div>
+        <div id="req-extract" class="req-extract" hidden></div>
+        <div id="req-summary" class="req-summary" aria-live="polite"></div>
+        <label class="toggle advanced-toggle"><input id="req-advanced" type="checkbox"><span>Advanced JSON mode (expert)</span></label>
+        <div id="req-json-wrap" hidden>
+          <textarea id="req-json" class="field" rows="8" spellcheck="false">[]</textarea>
+          <div class="req-json-actions">
+            <button id="req-json-copy" class="mini-button" type="button">Copy</button>
+            <button id="req-json-export" class="mini-button" type="button">Download</button>
+            <button id="req-json-import" class="mini-button" type="button">Import…</button>
+            <input id="req-json-file" type="file" accept="application/json,.json" hidden>
+            <button id="req-json-reset" class="mini-button" type="button">Reset to guided</button>
+          </div>
+        </div>
+        <p id="req-error" class="field-error" role="alert"></p>
+      </details>
+
+      <details class="form-collapse" open><summary>Run controls</summary>
+        <div class="limits-grid">
+          <label>Maximum iterations<input id="limit-iterations" class="field" type="number" min="1" max="50" value="5" required></label>
+          <label>Maximum runtime (minutes)<input id="limit-runtime" class="field" type="number" min="1" max="10080" value="20" required></label>
+          <label>Stop after generation failures<input id="limit-failures" class="field" type="number" min="1" max="20" value="3" required></label>
+          <label>Stop after no improvement<input id="limit-no-improvement" class="field" type="number" min="1" max="20" value="2" required></label>
+          <label>Target quality score (optional)<input id="limit-target" class="field" type="number" min="0" max="100" placeholder="No target"></label>
+        </div>
+        <p id="run-estimate" class="estimate"></p>
+      </details>
+
+      <p class="muted">Creates isolated versioned state only. Start is a separate action; no production model is overwritten and no rule is activated.</p>
+      <div class="modal-actions"><button id="create-run-submit" class="button" type="submit" disabled>Create run</button><button class="button secondary" type="button" data-close-new-run>Cancel</button></div>
+    </form>
+  </dialog>
+
+  <div id="connection-status" class="connection-status" role="status" aria-live="polite">Connecting…</div>
+
+  <script type="importmap">
+  {"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/"}}
+  </script>
+  <script type="module" src="/training-lab/training-lab.js"></script>
+</body>
+</html>

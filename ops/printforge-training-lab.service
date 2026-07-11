@@ -1,0 +1,13 @@
+[Unit]
+Description=PrintForge isolated Training Lab test service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/printforge
+ExecStart=%h/projects/printforge/run-training-lab.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
