@@ -24,7 +24,15 @@ from pydantic import BaseModel
 from parts import floating_starts, split_parts, write_3mf
 from prompts import SYSTEM_PROMPT, archetype_notes, qa_prompt, spec_prompt, user_prompt
 from evolution_lab import EvolutionAdapters, EvolutionLabConfig, create_router
+from evolution_lab.cadquery import CadQueryPipeline, CadQuerySandboxError
 from evolution_lab.requirements import requirements_prompt_block, verify_requirements
+from evolution_lab.slicer import (
+    BambuBinaryIdentity,
+    BambuProfileBundle,
+    BambuStudioCLIAdapter,
+    SlicerError,
+    runtime_readiness as bambu_runtime_readiness,
+)
 
 # "codex" shells out to the codex CLI (gpt-5.5, host only) and falls back to HTTP on failure
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "http")
@@ -45,6 +53,67 @@ LIB_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR = Path(__file__).parent / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 EVOLUTION_LAB_CONFIG = EvolutionLabConfig.from_env()
+
+
+def _configured_bambu_adapter(config: EvolutionLabConfig):
+    """Build the pinned adapter only after the explicit smoke record still matches."""
+
+    if not config.bambu_slicer_enabled:
+        return None, {"runtime_ready": False, "reason": "Bambu slicing is disabled"}
+    required = (
+        config.bambu_binary, config.bambu_version, config.bambu_sha256,
+        config.bwrap_binary, config.bwrap_version, config.bwrap_sha256,
+        config.bambu_machine_profile, config.bambu_process_profile,
+        config.bambu_filament_profile, config.bambu_smoke_evidence,
+    )
+    if not all(required):
+        return None, {"runtime_ready": False, "reason": "pinned binaries, profiles, and smoke evidence are required"}
+    try:
+        profiles = BambuProfileBundle.from_paths(
+            Path(config.bambu_machine_profile),
+            Path(config.bambu_process_profile),
+            Path(config.bambu_filament_profile),
+        )
+        bambu_identity = BambuBinaryIdentity(config.bambu_version, config.bambu_sha256)
+        bwrap_identity = BambuBinaryIdentity(config.bwrap_version, config.bwrap_sha256)
+        smoke = json.loads(Path(config.bambu_smoke_evidence).read_text(encoding="utf-8"))
+        if not isinstance(smoke, dict):
+            raise ValueError("smoke evidence must be a JSON object")
+        status = bambu_runtime_readiness(
+            profiles=profiles,
+            smoke_evidence=smoke,
+            bambu_binary=config.bambu_binary,
+            bwrap_binary=config.bwrap_binary,
+            binary_identity=bambu_identity,
+            bwrap_identity=bwrap_identity,
+        )
+        if not status["runtime_ready"]:
+            return None, status
+        return BambuStudioCLIAdapter(
+            profiles,
+            bambu_binary=config.bambu_binary,
+            bwrap_binary=config.bwrap_binary,
+            binary_identity=bambu_identity,
+            bwrap_identity=bwrap_identity,
+        ), status
+    except (OSError, ValueError, json.JSONDecodeError, SlicerError) as exc:
+        return None, {"runtime_ready": False, "reason": str(exc)[:500]}
+
+
+LAB_BAMBU_SLICER, LAB_BAMBU_SLICER_STATUS = _configured_bambu_adapter(EVOLUTION_LAB_CONFIG)
+
+
+class _UnavailableCadQueryExecutor:
+    def execute(self, source, parameters, assets):
+        raise CadQuerySandboxError("the pinned CadQuery sandbox runtime is not configured")
+
+
+# This deliberately exists even while host readiness is false: generated CadQuery
+# candidates enter the real contract pipeline and are persisted as blocked instead
+# of silently falling back to the legacy OpenSCAD evaluator.
+LAB_CADQUERY_PIPELINE = CadQueryPipeline(
+    _UnavailableCadQueryExecutor(), slicer=LAB_BAMBU_SLICER
+)
 
 app = FastAPI(title="PrintForge")
 
@@ -601,7 +670,10 @@ def promoted_rules_block(prompt: str = "") -> str:
             "confirmed across multiple models. Apply any that fit this request:\n" + lines + "\n")
 
 
-def promote_exemplar_to_library(scad: str, name: str, prompt: str, score, candidate_id: str) -> str:
+def promote_exemplar_to_library(
+    scad: str, name: str, prompt: str, score, candidate_id: str,
+    promotion_context: dict | None = None,
+) -> str:
     """Promote a Training Lab winning candidate into the production library as a thumbs-up
     few-shot exemplar (consumed by _taste_example). Reversible: it is a normal rated model."""
     for existing_dir in LIB_DIR.iterdir():
@@ -629,6 +701,7 @@ def promote_exemplar_to_library(scad: str, name: str, prompt: str, score, candid
         "source": "evolution-lab",
         "source_candidate_id": candidate_id,
         "score": score,
+        "promotion_provenance": promotion_context or {},
         "created": time.time(),
         "promoted_at": time.time(),
     }))
@@ -2085,6 +2158,52 @@ def _lab_evaluate_candidate(scad: str, context: dict) -> dict:
     }
 
 
+def _lab_evaluate_cadquery_candidate(source: str, context: dict) -> dict:
+    try:
+        result = LAB_CADQUERY_PIPELINE.evaluate(
+            source,
+            parameter_values=context.get("parameter_values") or {},
+            assets=context.get("assets") or {},
+        )
+    except Exception as exc:
+        return {
+            "model_format": "cadquery-v1",
+            "evidence": [],
+            "failure_codes": ["cadquery_runtime_unavailable"],
+            "qa_results": {"status": "blocked", "deterministic": False},
+            "slicer_results": {
+                "status": "failed",
+                "failure_codes": ["slicer_unavailable"],
+                "failure_reason": str(exc)[:1000],
+            },
+            "promotion_blocked": True,
+            "bambuddy_send_blocked": True,
+            "artifacts": {},
+            "backend_calls": 0,
+            "estimated_cost": 0,
+        }
+    return {
+        **result,
+        "evidence": [
+            {
+                "category": "printability", "criterion": "CadQuery build, STEP, mesh, and slice gates",
+                "points_awarded": 25 if not result["hard_rejected"] else 0,
+                "points_possible": 25, "label": "SLICED", "source": "cadquery-v1 pipeline",
+                "summary": "All deterministic geometry and Bambu slice gates passed" if not result["hard_rejected"] else "A deterministic CadQuery gate failed",
+                "confidence": 1, "critical": True,
+            },
+            {
+                "category": "prompt_spec_adherence", "criterion": "locks and export roles",
+                "points_awarded": 20 if not result["hard_rejected"] else 0,
+                "points_possible": 20, "label": "MEASURED", "source": "cadquery-v1 pipeline",
+                "summary": "Hard locks and reference export roles were checked",
+                "confidence": 1, "critical": True,
+            },
+        ],
+        "qa_results": {"status": "evaluated", "deterministic": True},
+        "backend_calls": 0,
+        "estimated_cost": 0,
+    }
 def _lab_current_branch() -> str:
     result = subprocess.run(["git", "branch", "--show-current"], cwd=Path(__file__).parent, capture_output=True, text=True, timeout=2)
     return result.stdout.strip() or "detached"
@@ -2097,11 +2216,15 @@ app.include_router(create_router(
         generate_initial_candidate=_lab_generate_initial_candidate,
         generate_candidate=_lab_generate_candidate,
         evaluate_candidate=_lab_evaluate_candidate,
+        evaluate_cadquery_candidate=_lab_evaluate_cadquery_candidate,
         current_branch=_lab_current_branch,
         promote_exemplar=promote_exemplar_to_library,
+        promote_exemplar_with_context=promote_exemplar_to_library,
         revoke_exemplar=revoke_exemplar_from_library,
         promote_rule=promote_rule_to_production,
         revoke_rule=revoke_rule_from_production,
+        slicer_status=lambda: LAB_BAMBU_SLICER_STATUS,
+        bambu_slicer=LAB_BAMBU_SLICER,
     ),
     production_branch="main",
 ))

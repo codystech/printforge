@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import re
@@ -10,6 +11,7 @@ import zipfile
 from pathlib import PurePath
 from typing import Any
 
+from .dataset_v2 import SCHEMA_V2, build_examples_v2, canonical_sha256
 from .store import EvolutionStore, new_id, utc_ts
 
 
@@ -158,7 +160,11 @@ def _csv(examples: list[dict]) -> bytes:
     return output.getvalue().encode("utf-8")
 
 
-def render_export(examples: list[dict], fmt: str) -> tuple[str, str, bytes]:
+def render_export(
+    examples: list[dict],
+    fmt: str,
+    schema: str = "printforge-training-dataset-v1",
+) -> tuple[str, str, bytes]:
     if fmt == "json":
         return "dataset.json", "application/json", _json(examples)
     if fmt == "jsonl":
@@ -172,7 +178,7 @@ def render_export(examples: list[dict], fmt: str) -> tuple[str, str, bytes]:
             archive.writestr("dataset.jsonl", _jsonl(examples))
             archive.writestr("summary.csv", _csv(examples))
             archive.writestr("MANIFEST.json", json.dumps({
-                "schema": "printforge-training-dataset-v1",
+                "schema": schema,
                 "example_count": len(examples),
                 "contains_model_weights": False,
                 "actual_training_performed": False,
@@ -181,19 +187,63 @@ def render_export(examples: list[dict], fmt: str) -> tuple[str, str, bytes]:
     raise ValueError("unsupported export format")
 
 
-def create_export(store: EvolutionStore, dataset_type: str, fmt: str, run_id: str | None) -> dict:
-    examples = build_examples(store, dataset_type, run_id)
-    filename, media_type, content = render_export(examples, fmt)
-    export_id = new_id("dataset")
+def create_export(
+    store: EvolutionStore,
+    dataset_type: str,
+    fmt: str,
+    run_id: str | None,
+    schema_version: str = "printforge-training-dataset-v1",
+) -> dict:
+    """Persist an immutable dataset snapshot.
+
+    Omitting ``schema_version`` preserves the v1 Python/API helper contract.
+    New Training Lab HTTP clients request v2 explicitly through the schema.
+    The v2 identifier is content-bound so a trainer can pin both ID and hash.
+    """
+
+    if schema_version not in {"printforge-training-dataset-v1", SCHEMA_V2}:
+        raise ValueError("unsupported dataset schema")
+    examples = (
+        build_examples_v2(store, dataset_type, run_id)
+        if schema_version == SCHEMA_V2
+        else build_examples(store, dataset_type, run_id)
+    )
+    examples = [sanitize(example) for example in examples]
+    filename, media_type, content = render_export(examples, fmt, schema_version)
+    if schema_version == SCHEMA_V2:
+        identity_checksum = canonical_sha256({
+            "schema": schema_version,
+            "dataset_type": dataset_type,
+            "format": fmt,
+            "run_id": run_id,
+            "examples": examples,
+        })
+        export_id = f"dataset_{identity_checksum[:32]}"
+        try:
+            existing = store.get_record("datasets", export_id)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing.get("identity_checksum") != f"sha256:{identity_checksum}":
+                raise ValueError("dataset identity collision")
+            return existing
+    else:
+        identity_checksum = None
+        export_id = new_id("dataset")
     store.write_dataset_file(export_id, filename, content)
     record = {
         "id": export_id,
+        "dataset_id": export_id,
+        "schema": schema_version,
         "dataset_type": dataset_type,
         "format": fmt,
         "run_id": run_id,
         "filename": filename,
         "media_type": media_type,
         "example_count": len(examples),
+        "checksum": f"sha256:{hashlib.sha256(content).hexdigest()}",
+        "examples_checksum": f"sha256:{canonical_sha256(examples)}",
+        "identity_checksum": f"sha256:{identity_checksum}" if identity_checksum else None,
         "created_at": utc_ts(),
         "actual_training_performed": False,
     }

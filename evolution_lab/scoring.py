@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
+import re
 from typing import Iterable
 
 from .schemas import CATEGORY_MAXIMA, EvidenceInput, EvidenceLabel
@@ -20,6 +22,23 @@ HARD_FAILURES = {
     "not_exportable",
     "unsafe_geometry",
     "critical_evidence_unavailable",
+    "invalid_brep",
+    "step_export_failed",
+    "step_roundtrip_failed",
+    "stl_tessellation_failed",
+    "mesh_validation_failed",
+    "slicer_unavailable",
+    "slicer_binary_unpinned",
+    "slicer_binary_mismatch",
+    "slicer_bwrap_untrusted",
+    "slice_no_printable_parts",
+    "slice_failed",
+    "slice_empty",
+    "slice_output_oversized",
+    "slice_metrics_incomplete",
+    "slice_log_empty",
+    "slice_assembly_transform_unsupported",
+    "cadquery_runtime_unavailable",
 }
 
 DETERMINISTIC_LABELS = {
@@ -116,18 +135,84 @@ def score_candidate(evidence: Iterable[EvidenceInput | dict], failure_codes: Ite
         "formula_version": "printforge-evidence-v1",
     }
 
+
+def _finite_score(value: object) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
+def deterministic_candidate_eligible(candidate: dict) -> bool:
+    """Fail closed before any deterministic or learned ranking is consulted."""
+
+    score = candidate.get("score") if isinstance(candidate.get("score"), dict) else {}
+    total = score.get("total")
+    finite_total = _finite_score(total)
+    cadquery_slice_invalid = False
+    if candidate.get("model_format") == "cadquery-v1":
+        slicer = candidate.get("slicer_results") if isinstance(candidate.get("slicer_results"), dict) else {}
+        artifact_records = {
+            item.get("name"): item for item in candidate.get("artifacts") or []
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        sliced_name = slicer.get("sliced_3mf_artifact")
+        log_name = slicer.get("log_artifact")
+        required_artifacts = [artifact_records.get(sliced_name), artifact_records.get(log_name)]
+        cadquery_slice_invalid = not bool(
+            str(slicer.get("status") or "").casefold() == "complete"
+            and isinstance(slicer.get("estimated_time_seconds"), int)
+            and not isinstance(slicer.get("estimated_time_seconds"), bool)
+            and slicer["estimated_time_seconds"] > 0
+            and isinstance(slicer.get("filament_grams"), (int, float))
+            and not isinstance(slicer.get("filament_grams"), bool)
+            and float(slicer["filament_grams"]) > 0
+            and isinstance(slicer.get("layer_count"), int)
+            and not isinstance(slicer.get("layer_count"), bool)
+            and slicer["layer_count"] > 0
+            and isinstance(slicer.get("support_used"), bool)
+            and isinstance(slicer.get("warnings"), list)
+            and all(isinstance(item, str) and item for item in slicer["warnings"])
+            and isinstance(candidate.get("slicer_profile_fingerprint"), str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", candidate["slicer_profile_fingerprint"])
+            and all(
+                record and isinstance(record.get("size"), int) and record["size"] > 0
+                and isinstance(record.get("sha256"), str)
+                and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", record["sha256"])
+                for record in required_artifacts
+            )
+        )
+    return not (
+        candidate.get("status") in {"failed", "rejected", "cancelled"}
+        or bool(candidate.get("hard_rejected"))
+        or bool(candidate.get("failure_codes"))
+        or candidate.get("required_checks_passed") is not True
+        or score.get("hard_rejected") is True
+        or finite_total is None
+        or candidate.get("promotion_blocked") is True
+        or candidate.get("bambuddy_send_blocked") is True
+        or cadquery_slice_invalid
+    )
+
 def select_winner(candidates: list[dict], current_best_score: float) -> dict:
     """Select a winner without ever replacing the best with a regression."""
 
     valid = [
         candidate
         for candidate in candidates
-        if not candidate.get("score", {}).get("hard_rejected")
-        and candidate.get("status") not in {"failed", "rejected"}
+        if deterministic_candidate_eligible(candidate)
     ]
-    ranked = sorted(valid, key=lambda item: float(item.get("score", {}).get("total", 0)), reverse=True)
+    ranked = sorted(valid, key=lambda item: float(item["score"]["total"]), reverse=True)
     highest = ranked[0] if ranked else None
-    improved = bool(highest and float(highest["score"]["total"]) > float(current_best_score))
+    normalized_current_score = _finite_score(current_best_score)
+    improved = bool(
+        highest
+        and normalized_current_score is not None
+        and float(highest["score"]["total"]) > normalized_current_score
+    )
     return {
         "highest_scoring_candidate_id": highest.get("candidate_id") if highest else None,
         "highest_score": float(highest["score"]["total"]) if highest else None,

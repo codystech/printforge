@@ -55,10 +55,11 @@ def derive_status(rule: dict) -> str:
     failures = int(rule.get("failure_count", 0))
     rate = successes / max(1, successes + failures)
     models = len(set(rule.get("source_model_ids", [])))
+    physical = int(rule.get("physical_evidence_count", 0))
     major = bool(rule.get("major_regression_count", 0))
-    if evidence >= 10 and rate > 0.90 and models >= 2 and not major:
+    if evidence >= 10 and rate > 0.90 and models >= 2 and physical > 0 and not major:
         return "high-confidence"
-    if evidence >= 5 and rate > 0.80 and not major:
+    if evidence >= 5 and rate > 0.80 and physical > 0 and not major:
         return "validated"
     if evidence >= 3 and rate > 0.65:
         return "provisional"
@@ -105,6 +106,13 @@ class MemoryService:
 
     def observe(self, rule_id: str, observation: dict) -> dict:
         def apply(rule: dict) -> None:
+            observation_id = observation.get("physical_validation_id") or observation.get("observation_id")
+            if observation_id and any(
+                item.get("physical_validation_id") == observation_id
+                or item.get("observation_id") == observation_id
+                for item in rule.get("observations", [])
+            ):
+                return
             success = bool(observation["success"])
             rule["evidence_count"] = int(rule.get("evidence_count", 0)) + 1
             key = "success_count" if success else "failure_count"
@@ -127,6 +135,8 @@ class MemoryService:
                 "major_regression": bool(observation.get("major_regression")),
                 "source_model_id": observation.get("source_model_id"),
                 "source_candidate_id": observation.get("source_candidate_id"),
+                "physical_validation_id": observation.get("physical_validation_id"),
+                "observation_id": observation.get("observation_id"),
                 "note": observation.get("note", ""),
             }
             rule.setdefault("observations", []).append(item)
@@ -148,8 +158,12 @@ class MemoryService:
             compatible, reasons = scopes_compatible(rule.get("scope", {}), context)
             if status in INACTIVE_STATUSES or not compatible:
                 result["ignored"].append({"rule": rule, "reasons": reasons or [f"status {status}"]})
-            elif status in {"validated", "high-confidence"}:
+            elif status in {"validated", "high-confidence"} and int(
+                rule.get("physical_evidence_count", 0)
+            ) > 0:
                 result["applied"].append(rule)
+            elif status in {"validated", "high-confidence"}:
+                result["recommended"].append(rule)
             elif status == "provisional":
                 result["recommended"].append(rule)
             else:

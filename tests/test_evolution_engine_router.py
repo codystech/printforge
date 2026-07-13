@@ -678,6 +678,57 @@ class EvolutionEngineContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("generation-zero failure", attempt["failure_reason"])
         self.assertEqual(attempt["generation_prompt"], request["validated_spec"])
 
+    async def test_cadquery_generation_uses_dedicated_evaluator_and_persists_block(self) -> None:
+        calls = {"legacy": 0, "cadquery": 0}
+
+        async def generate(context):
+            return {
+                "model_format": "cadquery-v1",
+                "source": "PARAMETERS = {}\ndef build(params, assets):\n    return {}\n",
+                "backend": "unit-test/cadquery",
+                "backend_calls": 0,
+            }
+
+        async def legacy(source, context):
+            calls["legacy"] += 1
+            raise AssertionError("CadQuery source reached the legacy evaluator")
+
+        async def cadquery(source, context):
+            calls["cadquery"] += 1
+            self.assertEqual(context["model_format"], "cadquery-v1")
+            return {
+                "model_format": "cadquery-v1",
+                "evidence": [],
+                "failure_codes": ["cadquery_runtime_unavailable"],
+                "slicer_results": {"status": "failed", "failure_codes": ["slicer_unavailable"]},
+                "promotion_blocked": True,
+                "bambuddy_send_blocked": True,
+                "artifacts": {},
+            }
+
+        store = EvolutionStore(Path(self.tempdir.name) / "cadquery-engine-store")
+        engine = EvolutionEngine(store, EvolutionLabConfig(
+            evolution_enabled=True, training_lab_enabled=True, data_root=store.root,
+        ), EvolutionAdapters(
+            generate_initial_candidate=generate,
+            evaluate_candidate=legacy,
+            evaluate_cadquery_candidate=cadquery,
+        ))
+        request = self.run_request()
+        request.update({"run_mode": "create_from_spec", "source_model_id": None})
+        created = await engine.create_run(request)
+        await engine._run(created["run_id"])
+        snapshot = engine.snapshot(created["run_id"])
+        candidate = snapshot["candidates"][0]
+        self.assertEqual(calls, {"legacy": 0, "cadquery": 1})
+        self.assertEqual(candidate["model_format"], "cadquery-v1")
+        self.assertTrue(candidate["promotion_blocked"])
+        self.assertTrue(candidate["bambuddy_send_blocked"])
+        self.assertIn("cadquery_runtime_unavailable", candidate["failure_reasons"])
+        self.assertTrue(store.candidate_artifact(
+            created["run_id"], candidate["candidate_id"], "model.py"
+        ).is_file())
+
     async def test_iteration_limit_stops_after_configured_bound(self) -> None:
         fake = FakeEvolutionBackend(
             baseline_score=10, candidate_scores={"A": 20, "B": 15},
@@ -903,11 +954,27 @@ class TrainingLabUiContractTests(unittest.TestCase):
             source,
         )
         self.assertIn("candidate?.required_checks_passed === true", source)
+        self.assertIn("candidate?.model_format !== 'cadquery-v1' || cadQueryPromotionSupported()", source)
+        self.assertIn("add('CadQuery promotion unavailable'", source)
         self.assertIn("if (canPromoteExemplar(candidate))", source)
         self.assertIn("if (promoted) {\n    add('Remove from production'", source)
         self.assertIn("model?.source_candidate_id === candidateId(candidate)", source)
         self.assertIn("button.disabled = true", source)
         self.assertIn("button.textContent = 'Remove from production'", source)
+
+    def test_physical_validation_uses_candidate_slice_evidence_and_backend_roles(self) -> None:
+        source = (
+            Path(__file__).parents[1] / "static" / "training-lab" / "training-lab.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "candidate?.slicer_profile_fingerprint ?? candidate?.slicer_results?.profile_fingerprint",
+            source,
+        )
+        self.assertIn("part?.export_role === 'printable'", source)
+        self.assertNotIn("['printable', 'assembly'].includes(part?.export_role)", source)
+        self.assertIn("slicer_profile: form.dataset.slicerProfileFingerprint", source)
+        self.assertNotIn("slicer_profile: state.run.slicer_profile ?? null", source)
 
 
 if __name__ == "__main__":

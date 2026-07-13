@@ -23,6 +23,7 @@ class EvolutionConfigTests(unittest.TestCase):
         "PRINT_FORGE_MEMORY_LEARNING_ENABLED": "memory_learning_enabled",
         "PRINT_FORGE_PHYSICAL_FEEDBACK_ENABLED": "physical_feedback_enabled",
         "PRINT_FORGE_ACTUAL_TRAINING_ENABLED": "actual_training_enabled",
+        "PRINT_FORGE_CADQUERY_ENABLED": "cadquery_enabled",
         "PRINT_FORGE_TRAINED_MODEL_APPROVED": "trained_model_approved",
         "PRINT_FORGE_LAB_ONLY": "lab_only",
     }
@@ -240,6 +241,26 @@ class EvolutionStoreTests(unittest.TestCase):
             self.store.write_json(checkpoint_dir / "manifest.json", {"changed": True}, exclusive=True)
         self.assertEqual((checkpoint_dir / "model.scad").read_bytes(), original_model)
         self.assert_user_data_untouched()
+
+    def test_artifact_readers_reject_symlinked_ancestor_directories(self) -> None:
+        self.create_run()
+        self.create_candidate()
+        self.store.add_candidate_artifacts("run_safe", "candidate_a", {"model.scad": "sphere(5);"})
+        artifacts = self.store.candidate_dir("run_safe", "candidate_a") / "artifacts"
+        real_artifacts = artifacts.with_name("real-artifacts")
+        artifacts.rename(real_artifacts)
+        artifacts.symlink_to(real_artifacts, target_is_directory=True)
+        with self.assertRaises(FileNotFoundError):
+            self.store.candidate_artifact("run_safe", "candidate_a", "model.scad")
+
+        export = self.root / "datasets" / "export_safe"
+        export.mkdir()
+        (export / "dataset.json").write_text("{}", encoding="utf-8")
+        real_export = export.with_name("real-export")
+        export.rename(real_export)
+        export.symlink_to(real_export, target_is_directory=True)
+        with self.assertRaises(FileNotFoundError):
+            self.store.dataset_file("export_safe", "dataset.json")
 
     def test_demo_and_real_runs_are_persisted_in_separate_histories(self) -> None:
         self.create_run("real_run", demo=False)

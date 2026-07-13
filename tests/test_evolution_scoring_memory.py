@@ -8,7 +8,7 @@ from pathlib import Path
 
 from evolution_lab.memory import MemoryService, derive_status, scopes_compatible
 from evolution_lab.schemas import CATEGORY_MAXIMA, EvidenceLabel, ScoreCategory
-from evolution_lab.scoring import score_candidate, select_winner
+from evolution_lab.scoring import deterministic_candidate_eligible, score_candidate, select_winner
 from evolution_lab.store import EvolutionStore
 
 
@@ -122,8 +122,10 @@ class EvidenceScoringTests(unittest.TestCase):
 
     def test_lower_scoring_candidates_never_replace_current_best(self) -> None:
         candidates = [
-            {"candidate_id": "candidate_a", "status": "evaluated", "score": {"total": 89}},
-            {"candidate_id": "candidate_b", "status": "evaluated", "score": {"total": 90}},
+            {"candidate_id": "candidate_a", "status": "evaluated", "required_checks_passed": True,
+             "hard_rejected": False, "failure_codes": [], "score": {"total": 89, "hard_rejected": False}},
+            {"candidate_id": "candidate_b", "status": "evaluated", "required_checks_passed": True,
+             "hard_rejected": False, "failure_codes": [], "score": {"total": 90, "hard_rejected": False}},
         ]
         result = select_winner(candidates, current_best_score=91)
 
@@ -137,11 +139,16 @@ class EvidenceScoringTests(unittest.TestCase):
             {
                 "candidate_id": "invalid_high",
                 "status": "evaluated",
+                "required_checks_passed": True,
+                "failure_codes": [],
                 "score": {"total": 99, "hard_rejected": True},
             },
             {
                 "candidate_id": "valid_improvement",
                 "status": "evaluated",
+                "required_checks_passed": True,
+                "hard_rejected": False,
+                "failure_codes": [],
                 "score": {"total": 92, "hard_rejected": False},
             },
         ]
@@ -149,6 +156,37 @@ class EvidenceScoringTests(unittest.TestCase):
 
         self.assertEqual(result["winner_candidate_id"], "valid_improvement")
         self.assertTrue(result["improved_current_best"])
+
+    def test_cadquery_requires_exact_slice_evidence_and_no_delivery_blocks(self) -> None:
+        candidate = {
+            "candidate_id": "cadquery_valid",
+            "model_format": "cadquery-v1",
+            "status": "evaluated",
+            "required_checks_passed": True,
+            "failure_codes": [],
+            "score": {"total": 90, "hard_rejected": False},
+            "slicer_profile_fingerprint": "sha256:" + "a" * 64,
+            "slicer_results": {
+                "status": "complete", "estimated_time_seconds": 60,
+                "filament_grams": 1.0, "layer_count": 10,
+                "support_used": False, "warnings": [],
+                "sliced_3mf_artifact": "candidate.sliced.3mf",
+                "log_artifact": "candidate.slicer.log",
+            },
+            "artifacts": [
+                {"name": "candidate.sliced.3mf", "size": 10, "sha256": "b" * 64},
+                {"name": "candidate.slicer.log", "size": 10, "sha256": "c" * 64},
+            ],
+        }
+        self.assertTrue(deterministic_candidate_eligible(candidate))
+        for update in (
+            {"promotion_blocked": True},
+            {"bambuddy_send_blocked": True},
+            {"slicer_results": {**candidate["slicer_results"], "status": "passed"}},
+            {"artifacts": candidate["artifacts"][:1]},
+        ):
+            with self.subTest(update=update):
+                self.assertFalse(deterministic_candidate_eligible({**candidate, **update}))
 
 
 class MemoryLearningTests(unittest.TestCase):
@@ -232,8 +270,8 @@ class MemoryLearningTests(unittest.TestCase):
         pla_rule = self.create_rule(material="PLA", title="PLA rule")
         petg_rule = self.create_rule(material="PETG", title="PETG rule")
         for index in range(1, 6):
-            self.observe_success(pla_rule["id"], index)
-            self.observe_success(petg_rule["id"], index)
+            self.observe_success(pla_rule["id"], index, physical=index == 5)
+            self.observe_success(petg_rule["id"], index, physical=index == 5)
 
         context = {
             "printer": "Bambu P1S",

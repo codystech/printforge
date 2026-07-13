@@ -36,6 +36,10 @@
       <button id="resume-run" class="button secondary" type="button" hidden>Resume</button>
       <button id="stop-run" class="button secondary" type="button" hidden>Stop after generation</button>
       <button id="cancel-run" class="button danger" type="button" hidden>Cancel now</button>
+      <select id="export-schema" class="field small" aria-label="Dataset export schema" hidden>
+        <option value="printforge-training-dataset-v1" selected>Dataset v1 · compatibility</option>
+        <option value="printforge-training-dataset-v2">Dataset v2 · strict training quality</option>
+      </select>
       <button id="export-run" class="button secondary" type="button" hidden>Export</button>
       <button id="open-benchmarks" class="button secondary" type="button">Benchmarks</button>
       <button id="refresh-run" class="button secondary" type="button">Refresh</button>
@@ -199,6 +203,27 @@
         <label class="form-row">Printer profile<select id="new-profile" class="field" required><option value="">Loading printer profiles…</option></select></label>
       </details>
 
+      <details class="form-collapse" open><summary>Training-data identity and consent</summary>
+        <label class="form-row">Design / part family
+          <input id="new-part-family" class="field" maxlength="160" required placeholder="Example: captured latch">
+          <small>All parents, A/B siblings, and repairs in this family stay in one train/validation/test split.</small>
+        </label>
+        <label class="toggle advanced-toggle"><input id="new-training-consent" type="checkbox"><span>I explicitly approve this run's generated source for future neural training.</span></label>
+        <p class="muted">Consent is off by default. The run can evolve without consent, but dataset v2 will exclude its source.</p>
+        <div id="training-provenance-fields" class="form-section" hidden>
+          <div class="limits-grid">
+            <label>Provenance status<select id="new-provenance-status" class="field"><option value="unknown" selected>Not reviewed</option><option value="self-created">Self-created</option><option value="verified">Verified source</option><option value="licensed">Licensed source</option></select></label>
+            <label>Human reviewer<input id="new-consent-reviewer" class="field" maxlength="160" placeholder="Reviewer name"></label>
+            <label>Reviewed at, local time<input id="new-consent-reviewed-at" class="field" type="datetime-local"></label>
+            <label>Provenance source<input id="new-provenance-source" class="field" maxlength="500" placeholder="Owner-authored PrintForge run"></label>
+            <label>Source revision<input id="new-provenance-revision" class="field" maxlength="240" placeholder="Library revision, commit, or review ID"></label>
+            <label>License<input id="new-provenance-license" class="field" maxlength="240" placeholder="Owner-authored / SPDX identifier"></label>
+            <label>Training rights<select id="new-provenance-rights" class="field"><option value="not_reviewed" selected>Not reviewed</option><option value="owned">Owned by reviewer</option><option value="licensed_for_training">Licensed for training</option><option value="public_domain">Public domain</option></select></label>
+          </div>
+          <p class="muted">PrintForge binds this review to each immutable source artifact hash. Labels alone never make a source eligible.</p>
+        </div>
+      </details>
+
       <details class="form-collapse" open><summary>Locked requirements</summary>
         <div class="req-toolbar">
           <select id="req-preset" class="field small" aria-label="Requirement preset"></select>
@@ -236,6 +261,34 @@
 
       <p class="muted">Creates isolated versioned state only. Start is a separate action; no production model is overwritten and no rule is activated.</p>
       <div class="modal-actions"><button id="create-run-submit" class="button" type="submit" disabled>Create run</button><button class="button secondary" type="button" data-close-new-run>Cancel</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="physical-validation-dialog" class="evidence-dialog">
+    <form id="physical-validation-form">
+      <button class="dialog-close" type="button" data-close-physical aria-label="Close physical validation">×</button>
+      <p class="eyebrow">CHECKSUM-BOUND EVIDENCE</p>
+      <h2>Record physical print outcome</h2>
+      <label class="form-row">Printed artifact<select id="physical-artifact" class="field" required></select></label>
+      <label class="form-row">Outcome<select id="physical-success" class="field"><option value="true">Print succeeded</option><option value="false">Print failed</option></select></label>
+      <fieldset class="form-section">
+        <legend>Failure classes (failed prints only)</legend>
+        <div class="limits-grid">
+          <label><input type="checkbox" name="physical-failure" value="adhesion"> Adhesion</label>
+          <label><input type="checkbox" name="physical-failure" value="support_failure"> Support failure</label>
+          <label><input type="checkbox" name="physical-failure" value="fused_fit"> Fused fit</label>
+          <label><input type="checkbox" name="physical-failure" value="loose_fit"> Loose fit</label>
+          <label><input type="checkbox" name="physical-failure" value="dimensional_error"> Dimensional error</label>
+          <label><input type="checkbox" name="physical-failure" value="weak_feature"> Weak feature</label>
+          <label><input type="checkbox" name="physical-failure" value="warping"> Warping</label>
+          <label><input type="checkbox" name="physical-failure" value="surface_quality"> Surface quality</label>
+          <label><input type="checkbox" name="physical-failure" value="printer_material_failure"> Printer/material failure</label>
+          <label><input type="checkbox" name="physical-failure" value="other"> Other</label>
+        </div>
+      </fieldset>
+      <label class="form-row">Notes<textarea id="physical-notes" class="field" rows="4" maxlength="4000" placeholder="Required when Other is selected"></textarea></label>
+      <p class="muted">The server re-hashes the stored STL or sliced 3MF and joins this result to its run and candidate before it becomes trusted evidence.</p>
+      <div class="modal-actions"><button class="button" type="submit">Save physical outcome</button><button class="button secondary" type="button" data-close-physical>Cancel</button></div>
     </form>
   </dialog>
 
