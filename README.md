@@ -79,6 +79,16 @@ straight to the Bambuddy archive.
 **Evolution Training Lab (experimental, disabled by default)**
 - `/training-lab/` is an isolated runtime-evolution workspace; it never replaces
   the normal Generate workflow and never writes candidates into `library/`
+- The additive `cadquery-v1` foundation defines literal, AST-parsed parameters,
+  `build(params, assets)`, named parts with explicit transforms/export roles,
+  content-addressed manifests, and mandatory B-rep → STEP → STEP round-trip →
+  STL → existing-mesh-check gates derived by a trusted parent validator from
+  captured files, never generated pass/fail claims. Its bounded Bubblewrap
+  boundary rejects oversized/symlinked output and exposes contract support
+  separately from runtime readiness. It remains disabled until a pinned
+  CadQuery worker, Bubblewrap dependency, and dedicated service/cgroup limits
+  are installed and proven; existing OpenSCAD artifacts remain renderable
+  legacy models.
 - Two controlled candidates share one baseline, specification, profile, locks,
   reference roles and export exclusions; evidence scoring selects a winner only
   when it beats the immutable current best
@@ -116,9 +126,40 @@ straight to the Bambuddy archive.
 - The page visualizes persisted pipeline state, synchronized A/B previews,
   rewards, issues, mutations, lineage, memory, score progression and event logs;
   its seeded SIX SEVEN example is permanently labeled demo data
-- Dataset exports produce redacted JSON, JSONL, CSV or ZIP preference, repair,
-  calibration, supervised and failure examples. This prepares data; it does not
-  change neural-network weights.
+- Dataset exports retain the compatible redacted v1 formats and add an explicit
+  `printforge-training-dataset-v2` contract for SFT, preference, mutation,
+  repair, verified-failure and print-outcome rows. V2 binds immutable source and
+  artifact hashes to consent/provenance, evaluator/profile fingerprints,
+  evidence masks and part-family-separated splits; rendered-only, demo,
+  failed/cancelled, hard-rejected or unconsented data fails closed. Physical
+  feedback must match a printable `(run_id, candidate_id, artifact checksum)`
+  tuple. It is persisted pending, replay-idempotent, and becomes verified only
+  after candidate, mutation and scoped-memory backlinks succeed; exports
+  revalidate those exact records and veto contradicted preference labels. Exact
+  physically failed artifacts cannot become SFT completions through a metadata
+  override. The UI keeps
+  consent off and v1 export selected by default, and requires a family plus
+  human-reviewed source/revision/license-rights provenance for v2 eligibility;
+  rights are limited to owned, licensed-for-training, or public-domain data.
+  This prepares
+  data; dataset export itself does not change neural-network weights or invent
+  slicer results. See
+  `docs/training-lab-data-v2.md`.
+- Phase 3 adds a dormant, versioned Bambu Studio CLI boundary for eligible
+  `cadquery-v1` candidates. It snapshots full machine/process/filament profiles,
+  fingerprints the adapter, pinned binary and raw profiles, and persists sliced
+  3MF, logs, time/filament/layer/support metrics and warnings. Missing or failed
+  evidence hard-rejects the candidate and blocks restore, promotion and
+  Bambuddy delivery. Runtime readiness remains false until real Bambu Studio,
+  Bubblewrap, pinned profiles and a matching smoke are proven; implementation
+  tests use injected runners only. See `docs/training-lab-bambu-slicing.md`.
+- Phase 0 ML tooling adds a non-training NVIDIA/CUDA/bitsandbytes preflight and an
+  opt-in, 10–50-step QLoRA smoke runner. Both are CLI-only, default to no
+  download/no execution, write only below `training_lab_data/`, and do not
+  deploy adapters. The runner requires the exact pinned compatibility set and an
+  approved, checksummed model/license review. Shared GPU locking and
+  specialization detection remain explicit Phase 4 blockers. See
+  `docs/training-lab-ml-phase0.md` for the guardrails.
 - Actual fine-tuning is not implemented for the current backends. The training
   endpoint reports unsupported and cannot deploy or merge anything.
 
@@ -154,6 +195,8 @@ Experimental flags all default to `false` and are read at startup:
 | `PRINT_FORGE_MEMORY_LEARNING_ENABLED` | permits scoped memory updates/application |
 | `PRINT_FORGE_PHYSICAL_FEEDBACK_ENABLED` | permits physical and calibration records |
 | `PRINT_FORGE_ACTUAL_TRAINING_ENABLED` | outer gate for a future supported training provider |
+| `PRINT_FORGE_CADQUERY_ENABLED` | advertises the dormant `cadquery-v1` capability; defaults off and does not install or wire a runtime |
+| `PRINT_FORGE_BAMBU_SLICER_ENABLED` | requests the dormant versioned Bambu slicer boundary; defaults off and never means runtime-ready without binaries, immutable profiles and a matching smoke |
 | `PRINT_FORGE_TRAINING_ENABLED` | future training-job gate; no provider exists today |
 | `PRINT_FORGE_LAB_ONLY` | blocks non-Training-Lab mutations on the isolated test service |
 

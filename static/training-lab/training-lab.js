@@ -35,8 +35,22 @@ const candidateId = candidate => candidate?.candidate_id ?? candidate?.id ?? nul
 const isCurrentBest = candidate => candidateId(candidate) === state.run?.current_best_candidate_id;
 const isPromotedExemplar = candidate => state.libraryModels.some(model =>
   model?.source === 'evolution-lab' && model?.source_candidate_id === candidateId(candidate));
+const cadQueryPromotionSupported = () => state.bootstrap?.capabilities?.cadquery_exemplar_promotion === true;
 const canPromoteExemplar = candidate => isCurrentBest(candidate)
-  && candidate?.required_checks_passed === true && !isPromotedExemplar(candidate);
+  && candidate?.required_checks_passed === true
+  && (candidate?.model_format !== 'cadquery-v1' || cadQueryPromotionSupported())
+  && !isPromotedExemplar(candidate);
+const candidateSlicerProfileFingerprint = candidate =>
+  candidate?.slicer_profile_fingerprint ?? candidate?.slicer_results?.profile_fingerprint ?? null;
+const printablePhysicalArtifacts = candidate => collection(candidate?.artifacts).filter(artifact => {
+  const name = String(artifact?.name ?? '').toLowerCase();
+  if (candidate?.model_format !== 'cadquery-v1') return name.endsWith('.stl');
+  const sliced = candidate?.slicer_results?.sliced_3mf_artifact;
+  if (artifact?.name === sliced && name.endsWith('.3mf')
+      && String(candidate?.slicer_results?.status ?? '').toLowerCase() === 'complete') return true;
+  return name.endsWith('.stl') && collection(candidate?.parts).some(part =>
+    part?.stl_artifact === artifact?.name && part?.export_role === 'printable');
+});
 const generation = candidate => finite(candidate?.generation_number ?? candidate?.generation) ?? 0;
 const totalScore = candidate => finite(candidate?.reward_score ?? candidate?.total_score ?? candidate?.score?.total ?? (typeof candidate?.score === 'number' ? candidate.score : null));
 const selection = candidate => String(candidate?.selection_status ?? candidate?.winner_status ?? candidate?.status ?? '').toLowerCase();
@@ -190,6 +204,7 @@ function populateHeader() {
   $('stop-run').hidden = !real || !/running|stopping/.test(String(run.status ?? '').toLowerCase());
   $('cancel-run').hidden = !real || !/running|stopping|cancelling/.test(String(run.status ?? '').toLowerCase());
   $('export-run').hidden = !real;
+  $('export-schema').hidden = !real;
 }
 
 function stageData(run, key) {
@@ -313,10 +328,15 @@ function renderCandidate(candidate, index) {
   const candidateStatus = isWinner(candidate) ? 'Winner' : isRejected(candidate) ? 'Rejected' : candidate.status ?? 'Evaluated';
   statusEl.textContent = candidateStatus; statusEl.className = `status-label ${statusClass(candidateStatus)}`;
   const report = candidate.print_report ?? candidate.report ?? {};
+  const slice = candidate.slicer_results ?? {};
   const fields = [
     ['Reward', formatScore(totalScore(candidate))], ['Δ best', formatDelta(candidate.score_delta_current_best ?? candidate.delta_from_best)],
     ['QA', candidate.qa_status ?? candidate.geometry_qa?.status], ['Dimensions', Array.isArray(report.bbox_mm) ? `${report.bbox_mm.join(' × ')} mm` : candidate.dimensions],
     ['Parts', report.parts ?? candidate.part_count], ['Runtime', formatDuration(candidate.generation_duration ?? candidate.runtime_seconds)],
+    ['Slice', slice.status],
+    ['Print time', formatDuration(slice.estimated_time_seconds)],
+    ['Filament', present(slice.filament_grams) ? `${slice.filament_grams} g` : null],
+    ['Layers', slice.layer_count], ['Supports', present(slice.support_used) ? (slice.support_used ? 'Used' : 'None') : null],
   ];
   for (const [label, value] of fields) {
     const item = document.createElement('div'); item.className = 'meta-item';
@@ -503,6 +523,12 @@ function showCandidate(candidate) {
     try { const created = await postJSON(`/training-lab/api/candidates/${encodeURIComponent(candidateId(candidate))}/branch`); $('evidence-dialog').close(); await initialize(); await loadRun(runId(created)); }
     catch (error) { setConnection(`Branch failed: ${error.message}`, 'error'); }
   });
+  const printableArtifacts = printablePhysicalArtifacts(candidate);
+  const slicerProfileFingerprint = candidateSlicerProfileFingerprint(candidate);
+  if (state.bootstrap?.feature_flags?.physical_feedback_enabled && !isDemoRun(state.run)
+      && printableArtifacts.length && present(slicerProfileFingerprint)) {
+    add('Record physical outcome', () => openPhysicalValidation(candidate, printableArtifacts));
+  }
   const promoted = isPromotedExemplar(candidate);
   const revokePromoted = async event => {
     const button = event?.currentTarget;
@@ -530,6 +556,11 @@ function showCandidate(candidate) {
         setConnection(`Promote failed: ${error.message}`, 'error');
       }
     });
+  } else if (candidate?.model_format === 'cadquery-v1' && isCurrentBest(candidate)
+      && candidate?.required_checks_passed === true && !isPromotedExemplar(candidate)) {
+    const unavailable = add('CadQuery promotion unavailable', () => {});
+    unavailable.disabled = true;
+    unavailable.title = 'Production exemplar promotion does not yet support cadquery-v1 source.';
   }
   if (promoted) {
     add('Remove from production', revokePromoted);
@@ -540,6 +571,22 @@ function showCandidate(candidate) {
     catch (error) { setConnection(`Delete failed: ${error.message}`, 'error'); }
   }, true);
   body.appendChild(actions);
+}
+
+function openPhysicalValidation(candidate, artifacts) {
+  const form = $('physical-validation-form');
+  form.reset();
+  form.dataset.candidateId = candidateId(candidate);
+  form.dataset.slicerProfileFingerprint = candidateSlicerProfileFingerprint(candidate) ?? '';
+  const select = $('physical-artifact'); select.replaceChildren();
+  for (const artifact of artifacts) {
+    const option = document.createElement('option');
+    option.value = artifact.name;
+    option.dataset.sha256 = artifact.sha256;
+    option.textContent = `${artifact.name} · ${String(artifact.sha256).slice(0, 12)}…`;
+    select.appendChild(option);
+  }
+  $('physical-validation-dialog').showModal();
 }
 
 function showMemoryRule(title, rule) {
@@ -775,7 +822,21 @@ function validateRunForm() {
   const noImprovement = finite($('limit-no-improvement').value);
   const target = $('limit-target').value === '' ? null : finite($('limit-target').value);
   const limitsOk = iterations >= 1 && runtime >= 1 && failures >= 1 && noImprovement >= 1 && (target === null || (target >= 0 && target <= 100));
-  const valid = Boolean($('new-spec').value.trim() && selectedProfile() && locksOk && limitsOk && (mode === 'create_from_spec' || state.selectedModel));
+  const consent = $('new-training-consent').checked;
+  $('training-provenance-fields').hidden = !consent;
+  const reviewedAt = $('new-consent-reviewed-at').value;
+  const provenanceOk = !consent || Boolean(
+    ['self-created', 'verified', 'licensed'].includes($('new-provenance-status').value)
+    && $('new-consent-reviewer').value.trim()
+    && reviewedAt && !Number.isNaN(new Date(reviewedAt).getTime())
+    && $('new-provenance-source').value.trim()
+    && $('new-provenance-revision').value.trim()
+    && $('new-provenance-license').value.trim()
+    && ['owned', 'licensed_for_training', 'public_domain'].includes($('new-provenance-rights').value)
+  );
+  const valid = Boolean($('new-spec').value.trim() && $('new-part-family').value.trim()
+    && selectedProfile() && locksOk && limitsOk && provenanceOk
+    && (mode === 'create_from_spec' || state.selectedModel));
   $('create-run-submit').disabled = !valid;
   $('run-estimate').textContent = limitsOk
     ? `Up to ${iterations} refinement iteration${iterations === 1 ? '' : 's'} within ${runtime} minute${runtime === 1 ? '' : 's'}; stop after ${failures} failed generation${failures === 1 ? '' : 's'} or ${noImprovement} iteration${noImprovement === 1 ? '' : 's'} without improvement${target === null ? '.' : `; target score ${target}.`}`
@@ -809,11 +870,48 @@ async function prepareRunDialog() {
     $('req-error').textContent = ''; $('req-extract').hidden = true;
     const draft = state.builder.loadDraft();
     state.builder.setRequirements(Array.isArray(draft) ? draft : []);
+    $('new-training-consent').checked = false;
+    for (const id of ['new-consent-reviewer', 'new-consent-reviewed-at', 'new-provenance-source', 'new-provenance-revision', 'new-provenance-license']) $(id).value = '';
+    $('new-provenance-status').value = 'unknown'; $('new-provenance-rights').value = 'not_reviewed';
     renderModelPicker(); validateRunForm();
   } catch (error) { $('model-picker-error').textContent = `Could not load Library models: ${error.message}`; validateRunForm(); }
 }
 
 function setupControls() {
+  $('physical-validation-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const option = $('physical-artifact').selectedOptions[0];
+    const success = $('physical-success').value === 'true';
+    const failureClasses = [...form.querySelectorAll('input[name="physical-failure"]:checked')].map(input => input.value);
+    const notes = $('physical-notes').value.trim();
+    if (!success && !failureClasses.length) return setConnection('A failed print needs at least one failure class.', 'error');
+    if (success && failureClasses.length) return setConnection('A successful print cannot have failure classes.', 'error');
+    if (failureClasses.includes('other') && !notes) return setConnection('The “other” class needs a note.', 'error');
+    if (!option || !present(form.dataset.slicerProfileFingerprint)) {
+      return setConnection('Physical validation requires exact printable artifact and slicer-profile evidence.', 'error');
+    }
+    try {
+      await postJSON('/training-lab/api/physical-validations', {
+        run_id: runId(state.run), candidate_id: form.dataset.candidateId,
+        artifact_name: option.value, artifact_checksum: option.dataset.sha256,
+        printed_successfully: success,
+        printer_profile: state.run.printer_profile ?? {},
+        material: state.run.material_profile?.material ?? state.run.printer_profile?.material ?? null,
+        nozzle: finite(state.run.printer_profile?.nozzle),
+        layer_height: finite(state.run.printer_profile?.layer ?? state.run.printer_profile?.layer_height),
+        slicer_profile: form.dataset.slicerProfileFingerprint,
+        failure_classes: failureClasses, failure_notes: notes,
+      });
+      $('physical-validation-dialog').close();
+      $('evidence-dialog').close();
+      await loadRun(runId(state.run));
+      setConnection('Physical outcome joined to the exact candidate artifact.', 'ok');
+    } catch (error) { setConnection(`Physical validation failed: ${error.message}`, 'error'); }
+  });
+  for (const button of document.querySelectorAll('[data-close-physical]')) {
+    button.addEventListener('click', () => $('physical-validation-dialog').close());
+  }
   $('refresh-run').addEventListener('click', () => state.run ? loadRun(runId(state.run)) : initialize());
   $('run-select').addEventListener('change', event => { if (event.target.value) loadRun(event.target.value); });
   $('open-demo').addEventListener('click', () => { const id = demoRunId(); if (id) loadRun(id); });
@@ -824,7 +922,7 @@ function setupControls() {
   $('paste-id-toggle').addEventListener('change', event => { $('paste-id-row').hidden = !event.target.checked; });
   $('validate-pasted-id').addEventListener('click', validatePastedModel);
   $('new-source-id').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); validatePastedModel(); } });
-  for (const id of ['new-spec', 'new-profile', 'limit-iterations', 'limit-runtime', 'limit-failures', 'limit-no-improvement', 'limit-target']) $(id).addEventListener('input', validateRunForm);
+  for (const id of ['new-spec', 'new-profile', 'new-part-family', 'new-training-consent', 'new-provenance-status', 'new-consent-reviewer', 'new-consent-reviewed-at', 'new-provenance-source', 'new-provenance-revision', 'new-provenance-license', 'new-provenance-rights', 'limit-iterations', 'limit-runtime', 'limit-failures', 'limit-no-improvement', 'limit-target']) $(id).addEventListener('input', validateRunForm);
   $('new-run-form').addEventListener('submit', async event => {
     event.preventDefault(); if (!validateRunForm()) return; setConnection('Validating and creating isolated run…');
     try {
@@ -836,11 +934,26 @@ function setupControls() {
         catch { setSelectedModel(null); $('model-picker-error').textContent = 'The selected starting model no longer exists. Choose another model.'; throw new Error('Starting model was deleted before the run was created.'); }
       }
       const target = $('limit-target').value === '' ? null : Number($('limit-target').value);
+      const consent = $('new-training-consent').checked;
+      const reviewedAt = consent ? new Date($('new-consent-reviewed-at').value).toISOString() : null;
       const created = await postJSON('/training-lab/api/runs', {
         run_mode: mode, source_model_id: mode === 'evolve_existing' ? state.selectedModel.id : null, source_prompt: '',
         validated_spec: $('new-spec').value, printer_profile: profile,
         material_profile: { material: profile.material, layer_height: profile.layer },
         locked_constraints: locks, attached_reference_roles: [], export_exclusions: [],
+        part_family: $('new-part-family').value.trim(),
+        training_consent: consent,
+        training_consent_decision: consent ? 'approved' : 'not_reviewed',
+        training_consent_reviewer: consent ? $('new-consent-reviewer').value.trim() : '',
+        training_consent_reviewed_at: reviewedAt,
+        provenance_status: consent ? $('new-provenance-status').value : 'unknown',
+        data_provenance: consent ? {
+          status: $('new-provenance-status').value,
+          source: $('new-provenance-source').value.trim(),
+          source_revision: $('new-provenance-revision').value.trim(),
+          license: $('new-provenance-license').value.trim(),
+          license_rights: $('new-provenance-rights').value,
+        } : {},
         active_backend: 'codex/cli-default', auto_start: false,
         limits: {
           variants_per_generation: 2,
@@ -872,7 +985,10 @@ function setupControls() {
   });
   $('export-run').addEventListener('click', async () => {
     try {
-      const record = await postJSON('/training-lab/api/datasets', { dataset_type: 'all', format: 'zip', run_id: runId(state.run) });
+      const schema = $('export-schema').value;
+      if (schema.endsWith('-v2') && !confirm('Dataset v2 fails closed: only explicitly consented, provenance-audited sources with complete deterministic and slicer evidence are included. Continue?')) return;
+      const record = await postJSON('/training-lab/api/datasets', { dataset_type: 'all', format: 'zip', run_id: runId(state.run), schema_version: schema });
+      setConnection(`${schema.endsWith('-v2') ? 'Strict v2' : 'Compatibility v1'} export contains ${record.example_count} eligible example${record.example_count === 1 ? '' : 's'}.`, record.example_count ? '' : 'warning');
       location.href = `/training-lab/api/datasets/${encodeURIComponent(record.id)}/download`;
     } catch (error) { setConnection(`Export failed: ${error.message}`, 'error'); }
   });

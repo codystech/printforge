@@ -75,6 +75,20 @@ Notes:
   `LLM_BACKEND` unset (⇒ `http`). It has no codex (the CLI + auth live on the
   host).
 
+Training Lab also reads `PRINT_FORGE_CADQUERY_ENABLED` in
+`evolution_lab/config.py`. It defaults to false and only records a dormant
+`cadquery-v1` request in Training Lab bootstrap capabilities. Bootstrap reports
+contract support separately from `runtime_ready=false`; the flag does not
+install CadQuery/Bubblewrap, provide a dedicated worker, or replace the active
+OpenSCAD adapters.
+
+`PRINT_FORGE_BAMBU_SLICER_ENABLED` is a second off-by-default Training Lab
+request flag. It advertises that slicing was requested, but bootstrap keeps
+`slicer=false` and `bambu_slicer_runtime_ready=false` until a pinned Bambu
+Studio binary, Bubblewrap, complete immutable machine/process/filament profiles,
+and matching real smoke evidence are all available. The flag never installs or
+executes Bambu Studio by itself.
+
 ---
 
 ## 2. Hardcoded constants that act like config

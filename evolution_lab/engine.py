@@ -18,6 +18,11 @@ from typing import Any, Callable
 
 from .adaptive import adaptive_history_scope, outcome_record, select_mutations
 from .config import EvolutionLabConfig
+from .dataset_v2 import (
+    has_verified_physical_failure,
+    profile_fingerprint,
+    slice_evidence_ready,
+)
 from .memory import MemoryService
 from .schemas import EvidenceLabel, ScoreCategory
 from .scoring import score_candidate, select_winner
@@ -30,12 +35,16 @@ class EvolutionAdapters:
     generate_initial_candidate: Callable[[dict[str, Any]], dict[str, Any] | str] | None = None
     generate_candidate: Callable[[str, dict[str, Any]], dict[str, Any] | str] | None = None
     evaluate_candidate: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
+    evaluate_cadquery_candidate: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
     current_branch: Callable[[], str] | None = None
     # Human-gated promotion into production (injected by app.py; the lab store never writes there).
     promote_exemplar: Callable[..., str] | None = None
+    promote_exemplar_with_context: Callable[..., str] | None = None
     revoke_exemplar: Callable[[str], int] | None = None
     promote_rule: Callable[[dict], dict] | None = None
     revoke_rule: Callable[[str], int] | None = None
+    slicer_status: Callable[[], dict[str, Any]] | None = None
+    bambu_slicer: Any | None = None
 
 
 def _dump(value: Any) -> dict:
@@ -111,6 +120,83 @@ class EvolutionEngine:
         }))
 
     @staticmethod
+    def _candidate_data_fields(run: dict) -> dict:
+        """Additive dataset-v2 provenance/evidence placeholders for every candidate."""
+
+        provenance = dict(run.get("data_provenance") or {})
+        provenance.setdefault("status", run.get("provenance_status", "unknown"))
+        return {
+            "source_prompt": run.get("source_prompt", ""),
+            "validated_spec": run.get("validated_spec", ""),
+            "part_family_split_key": run.get("part_family_split_key", ""),
+            "training_consent": bool(run.get("training_consent", False)),
+            "training_consent_decision": run.get("training_consent_decision", "not_reviewed"),
+            "training_consent_reviewer": run.get("training_consent_reviewer", ""),
+            "training_consent_reviewed_at": run.get("training_consent_reviewed_at"),
+            "data_provenance": provenance,
+            "deterministic_evidence": [],
+            "slicer_results": {"status": "unavailable"},
+            "physical_outcomes": [],
+            "evaluator_version": None,
+            "evaluator_fingerprint": None,
+            "slicer_profile_fingerprint": None,
+            "evidence_coverage": {
+                "deterministic": {"present": False, "passed": None},
+                "slicer": {"present": False, "passed": None},
+                "physical": {"present": False, "passed": None},
+            },
+            "missing_evidence_mask": {"deterministic": True, "slicer": True, "physical": True},
+        }
+
+    @staticmethod
+    def _evaluation_data(run: dict, evaluation: dict, evidence: list[dict], passed: bool) -> dict:
+        slicer = evaluation.get("slicer_results") or {"status": "unavailable"}
+        slicer_ok = str(slicer.get("status") or "").casefold() == "complete"
+        evaluator_version = evaluation.get("evaluator_version") or "evolution-adapter-v1"
+        evaluator_fingerprint = evaluation.get("evaluator_fingerprint") or profile_fingerprint(
+            evaluator_version,
+            evaluation.get("required_check_versions") or {},
+        )
+        slicer_fingerprint = (
+            evaluation.get("slicer_profile_fingerprint")
+            or slicer.get("profile_fingerprint")
+        )
+        slicer_present = str(slicer.get("status") or "").casefold() not in {
+            "", "unavailable", "not_submitted", "missing", "skipped"
+        }
+        model_format = evaluation.get("model_format") or run.get("model_format") or "openscad-legacy"
+        delivery_blocked = bool(
+            model_format == "cadquery-v1"
+            and (
+                evaluation.get("promotion_blocked")
+                or evaluation.get("bambuddy_send_blocked")
+                or not slicer_ok
+            )
+        )
+        return {
+            "deterministic_evidence": evidence,
+            "slicer_results": slicer,
+            "evaluator_version": evaluator_version,
+            "evaluator_fingerprint": evaluator_fingerprint,
+            "slicer_profile_fingerprint": slicer_fingerprint,
+            "promotion_blocked": delivery_blocked,
+            "bambuddy_send_blocked": delivery_blocked,
+            "evidence_coverage": {
+                "deterministic": {"present": bool(evidence), "passed": bool(passed) if evidence else None},
+                "slicer": {
+                    "present": slicer_present,
+                    "passed": slicer_ok if slicer_present else None,
+                },
+                "physical": {"present": False, "passed": None},
+            },
+            "missing_evidence_mask": {
+                "deterministic": not bool(evidence),
+                "slicer": not slicer_present,
+                "physical": True,
+            },
+        }
+
+    @staticmethod
     def _fallback_evidence(meta: dict) -> list[dict]:
         report = meta.get("report") or {}
         measured = bool(report)
@@ -155,8 +241,17 @@ class EvolutionEngine:
         record = {
             "run_id": run_id, "demo": False, "status": "created",
             "run_mode": mode, "source_model_id": source_model_id,
+            "model_format": "openscad-legacy",
             "source_prompt": payload.get("source_prompt", ""),
             "validated_spec": payload["validated_spec"],
+            "part_family": str(payload.get("part_family") or "").strip(),
+            "part_family_split_key": str(payload.get("part_family") or "").strip().casefold(),
+            "training_consent": bool(payload.get("training_consent", False)),
+            "training_consent_decision": payload.get("training_consent_decision", "not_reviewed"),
+            "training_consent_reviewer": payload.get("training_consent_reviewer", ""),
+            "training_consent_reviewed_at": payload.get("training_consent_reviewed_at"),
+            "provenance_status": payload.get("provenance_status", "unknown"),
+            "data_provenance": payload.get("data_provenance") or {},
             "printer_profile": payload.get("printer_profile", {}),
             "material_profile": payload.get("material_profile", {}),
             "locked_constraints": payload.get("locked_constraints", []),
@@ -191,14 +286,23 @@ class EvolutionEngine:
         score = score_candidate(evidence, evaluation.get("failure_codes", []))
         baseline_id = new_id("candidate")
         baseline = {
+            **self._candidate_data_fields(run),
             "candidate_id": baseline_id, "run_id": run_id, "generation": 0,
             "version": 0,
             "variant_label": "BASELINE", "parent_candidate_id": None,
             "current_best_parent_id": None, "mutation": None, "status": "complete",
             "selection_status": "baseline", "score_evidence": evidence, "score": score,
-            "qa_results": evaluation.get("qa_results", []), "slicer_results": evaluation.get("slicer_results", {"status": "unavailable"}),
+            "qa_results": evaluation.get("qa_results", []),
             "issues": evaluation.get("issues", []), "artifacts": [],
+            "model_format": "openscad-legacy", "parameters": {}, "parts": [],
             "generation_prompt": run.get("source_prompt", ""),
+            "required_checks_passed": not score["hard_rejected"] and not evaluation.get("failure_codes", []),
+            **self._evaluation_data(
+                run,
+                evaluation,
+                evidence,
+                not score["hard_rejected"] and not evaluation.get("failure_codes", []),
+            ),
             "failure_reason": None, "created_at": utc_ts(), "updated_at": utc_ts(),
         }
         self.store.create_candidate(run_id, baseline)
@@ -227,6 +331,7 @@ class EvolutionEngine:
             candidate_id = new_id("candidate")
             now = utc_ts()
             self.store.create_candidate(run["run_id"], {
+                **self._candidate_data_fields(run),
                 "candidate_id": candidate_id, "run_id": run["run_id"],
                 "generation": 0, "version": 0, "variant_label": "GENERATION_ZERO",
                 "parent_candidate_id": None, "current_best_parent_id": None,
@@ -236,6 +341,8 @@ class EvolutionEngine:
                 "printer_profile_snapshot": run.get("printer_profile", {}),
                 "material_profile_snapshot": run.get("material_profile", {}),
                 "backend": run.get("active_backend") or "unknown", "status": "pending",
+                "model_format": run.get("model_format", "openscad-legacy"),
+                "parameters": {}, "parts": [],
                 "selection_status": "generation_zero", "artifacts": [],
                 "created_at": now, "updated_at": now,
             })
@@ -388,17 +495,30 @@ class EvolutionEngine:
             "mutation": {"mutation_type": "initial_design", "reason": "create from validated specification"},
         }
         t0 = time.monotonic()
-        scad = None
+        source = None
+        source_name = "model.scad"
         try:
             generated = await self._invoke(self.adapters.generate_initial_candidate, context)
             generated = {"scad": generated} if isinstance(generated, str) else generated
-            scad = generated["scad"]
+            model_format = str(generated.get("model_format") or "openscad-legacy")
+            if model_format not in {"openscad-legacy", "cadquery-v1"}:
+                raise ValueError(f"unsupported generated model format: {model_format}")
+            source_name = "model.py" if model_format == "cadquery-v1" else "model.scad"
+            source = generated.get("source") if model_format == "cadquery-v1" else generated.get("scad")
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(f"generated candidate is missing {source_name}")
+            context.update({"model_format": model_format, "source_name": source_name})
             self._set_stage(run_id, "generation_zero_evaluation", candidate_id=candidate_id)
-            evaluation = await self._invoke(self.adapters.evaluate_candidate, scad, context)
+            evaluator = (
+                self.adapters.evaluate_cadquery_candidate
+                if model_format == "cadquery-v1" else self.adapters.evaluate_candidate
+            )
+            evaluation = await self._invoke(evaluator, source, context)
+            evaluation.setdefault("model_format", model_format)
             failure_codes = list(evaluation.get("failure_codes", []))
             evidence = evaluation.get("evidence") or [_unverified(ScoreCategory.FUNCTION, "initial functional behavior", 25, True)]
             score = score_candidate(evidence, failure_codes)
-            artifacts = {"model.scad": scad, **(evaluation.get("artifacts") or {}), **(generated.get("artifacts") or {})}
+            artifacts = {source_name: source, **(evaluation.get("artifacts") or {}), **(generated.get("artifacts") or {})}
             self.store.add_candidate_artifacts(run_id, candidate_id, artifacts)
             duration = time.monotonic() - t0
             cost = float(generated.get("estimated_cost", 0) or 0) + float(evaluation.get("estimated_cost", 0) or 0)
@@ -407,17 +527,24 @@ class EvolutionEngine:
                 "selection_status": "rejected" if score["hard_rejected"] else "baseline",
                 "score_evidence": evidence, "score": score,
                 "qa_results": evaluation.get("qa_results", []),
-                "slicer_results": evaluation.get("slicer_results", {"status": "unavailable"}),
                 "issues": evaluation.get("issues", []), "failure_reasons": failure_codes,
                 "failure_reason": ", ".join(failure_codes) if failure_codes else None,
                 "rejection_reasons": score["hard_rejection_reasons"],
                 "required_checks_passed": not score["hard_rejected"] and not failure_codes,
                 "generation_duration_seconds": round(duration, 3),
                 "estimated_generation_cost": cost, "backend": generated.get("backend", row["backend"]),
+                "model_format": model_format,
+                "parameters": evaluation.get("parameters") or {},
+                "parts": evaluation.get("parts") or [],
+                "artifact_id": evaluation.get("artifact_id"),
+                **self._evaluation_data(
+                    run, evaluation, evidence, not score["hard_rejected"] and not failure_codes
+                ),
                 "completed_at": utc_ts(),
             }))
             self.store.update_run(run_id, lambda row: row.update({
                 "current_generation": 0, "estimated_cost": cost,
+                "model_format": model_format,
                 "backend_calls": int(generated.get("backend_calls", 1)) + int(evaluation.get("backend_calls", 0)),
             }))
             if score["hard_rejected"]:
@@ -436,9 +563,9 @@ class EvolutionEngine:
             self.store.append_event(run_id, "info", "generation_zero_completed", "Generation zero generated, evaluated, and checkpointed", candidate_id=candidate_id, generation=0)
         except asyncio.CancelledError:
             cancellation_reason = self.store.get_run(run_id).get("cancellation_reason") or "user_cancelled"
-            if scad:
+            if source:
                 try:
-                    self.store.add_candidate_artifacts(run_id, candidate_id, {"model.scad": scad})
+                    self.store.add_candidate_artifacts(run_id, candidate_id, {source_name: source})
                 except (FileExistsError, ValueError):
                     pass
             cancelled = self.store.update_candidate(run_id, candidate_id, lambda row: row.update({
@@ -450,9 +577,9 @@ class EvolutionEngine:
             self._record_mutation_outcome(run, cancelled, 0, 0.0)
             raise
         except Exception as exc:
-            if scad:
+            if source:
                 try:
-                    self.store.add_candidate_artifacts(run_id, candidate_id, {"model.scad": scad})
+                    self.store.add_candidate_artifacts(run_id, candidate_id, {source_name: source})
                 except (FileExistsError, ValueError):
                     pass
             candidate = self.store.get_candidate(run_id, candidate_id)
@@ -547,7 +674,9 @@ class EvolutionEngine:
     async def _generation(self, run_id: str, generation: int) -> None:
         run = self.store.get_run(run_id)
         parent_id = run["current_best_candidate_id"]
-        parent_scad = self.store.candidate_artifact(run_id, parent_id, "model.scad").read_text()
+        model_format = run.get("model_format") or "openscad-legacy"
+        parent_source_name = "model.py" if model_format == "cadquery-v1" else "model.scad"
+        parent_source = self.store.candidate_artifact(run_id, parent_id, parent_source_name).read_text()
         candidates = []
         for label, mutation in zip(("A", "B"), self._mutations(run, generation)):
             cid = new_id("candidate")
@@ -558,7 +687,9 @@ class EvolutionEngine:
                 "locked_constraints": run.get("locked_constraints", []),
                 "printer_profile": run.get("printer_profile", {}), "material_profile": run.get("material_profile", {}),
                 "attached_reference_roles": run.get("attached_reference_roles", []), "export_exclusions": run.get("export_exclusions", []),
-                "parent_scad": parent_scad, "cancel_event": self._cancel_events.get(run_id),
+                "parent_scad": parent_source if model_format == "openscad-legacy" else "",
+                "parent_source": parent_source, "model_format": model_format,
+                "cancel_event": self._cancel_events.get(run_id),
             }
             memory_match = {"applied": [], "recommended": [], "shown": [], "ignored": []}
             if self.config.memory_learning_enabled:
@@ -572,6 +703,7 @@ class EvolutionEngine:
                 })
             context["memory_rules"] = memory_match
             candidate = {
+                **self._candidate_data_fields(run),
                 "candidate_id": cid, "run_id": run_id, "generation": generation, "variant_label": label,
                 "version": generation,
                 "parent_candidate_id": parent_id, "current_best_parent_id": parent_id, "mutation": mutation,
@@ -581,6 +713,8 @@ class EvolutionEngine:
                 "spec_used": run["validated_spec"], "locks_applied": run.get("locked_constraints", []),
                 "printer_profile_snapshot": run.get("printer_profile", {}), "material_profile_snapshot": run.get("material_profile", {}),
                 "backend": run.get("active_backend") or "unknown", "status": "generating", "selection_status": "pending",
+                "model_format": run.get("model_format", "openscad-legacy"),
+                "parameters": {}, "parts": [],
                 "memory_rules_applied": [rule.get("rule_id") for rule in memory_match["applied"]],
                 "memory_rules_ignored": [{"rule_id": item["rule"].get("rule_id"), "reasons": item["reasons"]} for item in memory_match["ignored"]],
                 "artifacts": [], "created_at": now, "updated_at": now,
@@ -590,29 +724,49 @@ class EvolutionEngine:
             self.store.append_event(run_id, "info", "candidate_started", f"Variant {label} started", candidate_id=cid, generation=generation)
             t0 = time.monotonic()
             generated = None
-            scad = None
+            source = None
+            source_name = parent_source_name
             try:
-                generated = await self._invoke(self.adapters.generate_candidate, parent_scad, context)
+                generated = await self._invoke(self.adapters.generate_candidate, parent_source, context)
                 generated = {"scad": generated} if isinstance(generated, str) else generated
-                scad = generated["scad"]
+                candidate_format = str(generated.get("model_format") or model_format)
+                if candidate_format != model_format:
+                    raise ValueError("candidate mutation cannot change the run model format")
+                source_name = "model.py" if candidate_format == "cadquery-v1" else "model.scad"
+                source = generated.get("source") if candidate_format == "cadquery-v1" else generated.get("scad")
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError(f"generated candidate is missing {source_name}")
+                context.update({"model_format": candidate_format, "source_name": source_name})
                 self._set_stage(run_id, "evaluation", candidate_id=cid)
-                evaluation = await self._invoke(self.adapters.evaluate_candidate, scad, context)
+                evaluator = (
+                    self.adapters.evaluate_cadquery_candidate
+                    if candidate_format == "cadquery-v1" else self.adapters.evaluate_candidate
+                )
+                evaluation = await self._invoke(evaluator, source, context)
+                evaluation.setdefault("model_format", candidate_format)
                 failure_codes = list(evaluation.get("failure_codes", []))
                 evidence = evaluation.get("evidence") or [_unverified(ScoreCategory.FUNCTION, "functional behavior", 25, True)]
                 score = score_candidate(evidence, failure_codes)
-                artifacts = {"model.scad": scad, **(evaluation.get("artifacts") or {}), **(generated.get("artifacts") or {})}
+                artifacts = {source_name: source, **(evaluation.get("artifacts") or {}), **(generated.get("artifacts") or {})}
                 self.store.add_candidate_artifacts(run_id, cid, artifacts)
                 duration = time.monotonic() - t0
                 cost = float(generated.get("estimated_cost", 0) or 0) + float(evaluation.get("estimated_cost", 0) or 0)
                 def finish(row: dict) -> None:
                     row.update({
                         "status": "rejected" if score["hard_rejected"] else "evaluated", "score_evidence": evidence,
-                        "score": score, "qa_results": evaluation.get("qa_results", []), "slicer_results": evaluation.get("slicer_results", {"status": "unavailable"}),
+                        "score": score, "qa_results": evaluation.get("qa_results", []),
                         "issues": evaluation.get("issues", []), "failure_reasons": failure_codes,
                         "failure_reason": ", ".join(failure_codes) if failure_codes else None,
                         "rejection_reasons": score["hard_rejection_reasons"], "generation_duration_seconds": round(duration, 3),
                         "required_checks_passed": not score["hard_rejected"] and not failure_codes,
                         "estimated_generation_cost": cost, "backend": generated.get("backend", row["backend"]),
+                        "model_format": candidate_format,
+                        "parameters": evaluation.get("parameters") or {},
+                        "parts": evaluation.get("parts") or [],
+                        "artifact_id": evaluation.get("artifact_id"),
+                        **self._evaluation_data(
+                            run, evaluation, evidence, not score["hard_rejected"] and not failure_codes
+                        ),
                         "memory_rules_applied": evaluation.get("memory_rules_applied", []), "memory_rules_ignored": evaluation.get("memory_rules_ignored", []),
                         "completed_at": utc_ts(),
                     })
@@ -620,9 +774,9 @@ class EvolutionEngine:
                 self.store.update_run(run_id, lambda row: row.update({"estimated_cost": float(row.get("estimated_cost", 0)) + cost, "backend_calls": int(row.get("backend_calls", 0)) + int(generated.get("backend_calls", 1)) + int(evaluation.get("backend_calls", 0))}))
             except asyncio.CancelledError:
                 cancellation_reason = self.store.get_run(run_id).get("cancellation_reason") or "user_cancelled"
-                if scad:
+                if source:
                     try:
-                        self.store.add_candidate_artifacts(run_id, cid, {"model.scad": scad})
+                        self.store.add_candidate_artifacts(run_id, cid, {source_name: source})
                     except (FileExistsError, ValueError):
                         pass
                 cancelled = self.store.update_candidate(run_id, cid, lambda row: row.update({
@@ -644,9 +798,9 @@ class EvolutionEngine:
                 self.store.append_event(run_id, "warning", "candidate_cancelled", f"Variant {label} cancelled", candidate_id=cid, generation=generation)
                 raise
             except Exception as exc:
-                if scad:
+                if source:
                     try:
-                        self.store.add_candidate_artifacts(run_id, cid, {"model.scad": scad})
+                        self.store.add_candidate_artifacts(run_id, cid, {source_name: source})
                     except (FileExistsError, ValueError):
                         pass
                 evidence = [_unverified(ScoreCategory.PRINTABILITY, "candidate generation", 25, True)]
@@ -708,9 +862,18 @@ class EvolutionEngine:
         if self.task_active(run_id):
             raise ValueError("cancel or stop the run before restoring a candidate")
         candidate = self.store.get_candidate(run_id, candidate_id)
-        if candidate.get("status") in {"failed", "cancelled"} or candidate.get("score", {}).get("hard_rejected"):
+        run = self.store.get_run(run_id)
+        if candidate.get("status") in {"failed", "rejected", "cancelled"} or candidate.get("score", {}).get("hard_rejected"):
             raise ValueError("failed or hard-rejected candidates cannot be restored")
-        self.store.candidate_artifact(run_id, candidate_id, "model.scad")
+        if candidate.get("required_checks_passed") is not True:
+            raise ValueError("candidates that have not passed required checks cannot be restored")
+        if has_verified_physical_failure(self.store, run, candidate):
+            raise ValueError("candidates with a checksum-verified failed physical print cannot be restored")
+        if candidate.get("model_format") == "cadquery-v1":
+            if not slice_evidence_ready(self.store, run, candidate):
+                raise ValueError("CadQuery candidates without complete slice evidence cannot be restored")
+        source_name = "model.py" if candidate.get("model_format") == "cadquery-v1" else "model.scad"
+        self.store.candidate_artifact(run_id, candidate_id, source_name)
         checkpoint = self.store.create_checkpoint(run_id, candidate_id, "restored_best")
         score = float(candidate.get("score", {}).get("total", 0))
         self.store.update_run(run_id, lambda row: row.update({
@@ -728,13 +891,30 @@ class EvolutionEngine:
 
     async def branch_candidate(self, run_id: str, candidate_id: str) -> dict:
         candidate = self.store.get_candidate(run_id, candidate_id)
-        scad = self.store.candidate_artifact(run_id, candidate_id, "model.scad").read_text(encoding="utf-8")
         source_run = self.store.get_run(run_id)
+        if candidate.get("status") in {"failed", "rejected", "cancelled"}:
+            raise ValueError("failed or rejected candidates cannot be branched")
+        if candidate.get("score", {}).get("hard_rejected") or candidate.get("required_checks_passed") is not True:
+            raise ValueError("hard-rejected or unchecked candidates cannot be branched")
+        if has_verified_physical_failure(self.store, source_run, candidate):
+            raise ValueError("candidates with a checksum-verified failed physical print cannot be branched")
+        model_format = candidate.get("model_format") or "openscad-legacy"
+        if model_format == "cadquery-v1" and not slice_evidence_ready(self.store, source_run, candidate):
+            raise ValueError("CadQuery candidates without complete slice evidence cannot be branched")
+        source_name = "model.py" if model_format == "cadquery-v1" else "model.scad"
+        source = self.store.candidate_artifact(run_id, candidate_id, source_name).read_text(encoding="utf-8")
         payload = {
             "run_mode": "evolve_existing",
             "source_model_id": source_run.get("source_model_id") or "isolated-candidate",
             "source_prompt": source_run.get("source_prompt", ""),
             "validated_spec": source_run["validated_spec"],
+            "part_family": source_run.get("part_family", ""),
+            "training_consent": source_run.get("training_consent", False),
+            "training_consent_decision": source_run.get("training_consent_decision", "not_reviewed"),
+            "training_consent_reviewer": source_run.get("training_consent_reviewer", ""),
+            "training_consent_reviewed_at": source_run.get("training_consent_reviewed_at"),
+            "provenance_status": source_run.get("provenance_status", "unknown"),
+            "data_provenance": source_run.get("data_provenance", {}),
             "printer_profile": source_run.get("printer_profile", {}),
             "material_profile": source_run.get("material_profile", {}),
             "locked_constraints": source_run.get("locked_constraints", []),
@@ -749,13 +929,53 @@ class EvolutionEngine:
             "source_run_id": run_id,
             "source_candidate_id": candidate_id,
             "source_model_id": source_run.get("source_model_id"),
+            "model_format": model_format,
         })
         branch["adaptive_history_scope"] = adaptive_history_scope(branch)
-        snapshot = await self._attach_baseline(branch, scad, {
+        branch_meta = {
             "prompt": source_run.get("source_prompt", ""),
             "branched_from_run": run_id,
             "branched_from_candidate": candidate_id,
-        })
+        }
+        if model_format == "cadquery-v1":
+            self.store.create_run(branch, {"model.py": source, "meta.json": json.dumps(branch_meta)})
+            baseline_id = new_id("candidate")
+            clone = {
+                **candidate,
+                "candidate_id": baseline_id,
+                "run_id": branch["run_id"],
+                "generation": 0,
+                "version": 0,
+                "variant_label": "BASELINE",
+                "parent_candidate_id": None,
+                "current_best_parent_id": None,
+                "mutation": None,
+                "selection_status": "baseline",
+                "created_at": utc_ts(),
+                "updated_at": utc_ts(),
+                "artifacts": [],
+            }
+            self.store.create_candidate(branch["run_id"], clone)
+            cloned_artifacts: dict[str, bytes] = {}
+            for artifact in candidate.get("artifacts") or []:
+                name = artifact.get("name")
+                if isinstance(name, str):
+                    cloned_artifacts[name] = self.store.candidate_artifact(run_id, candidate_id, name).read_bytes()
+            cloned_artifacts[source_name] = source.encode()
+            self.store.add_candidate_artifacts(branch["run_id"], baseline_id, cloned_artifacts)
+            checkpoint = self.store.create_checkpoint(branch["run_id"], baseline_id, "baseline")
+            score = float((candidate.get("score") or {}).get("total", 0))
+            self.store.update_run(branch["run_id"], lambda row: row.update({
+                "baseline_candidate_id": baseline_id,
+                "current_best_candidate_id": baseline_id,
+                "highest_scoring_candidate_id": baseline_id,
+                "current_best_score": score,
+                "baseline_score": score,
+                "baseline_checkpoint_id": checkpoint["checkpoint_id"],
+            }))
+            snapshot = self.snapshot(branch["run_id"])
+        else:
+            snapshot = await self._attach_baseline(branch, source, branch_meta)
         self.store.append_event(snapshot["run_id"], "info", "run_branched", "Run branched from an isolated candidate", candidate_id=snapshot.get("baseline_candidate_id"), generation=0, data={"source_run_id": run_id, "source_candidate_id": candidate_id})
         return self.snapshot(snapshot["run_id"])
 

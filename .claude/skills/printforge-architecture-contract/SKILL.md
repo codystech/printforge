@@ -288,6 +288,9 @@ raises rather than silently degrade.
 | I12 | Deterministic checks (floating_starts, lock_violations, /validate booleans) gate; the vision LLM only advises. | parts.py:67; app.py:499; app.py:1462 |
 | I13 | Evolution candidates are versioned under `training_lab_data/`, never overwrite the current best, and every run has explicit finite stop controls. | evolution_lab/engine.py; evolution_lab/store.py |
 | I14 | `source_model_id` is required for `evolve_existing`, nullable for `create_from_spec`, and omitted `run_mode` remains backward-compatible. | evolution_lab/schemas.py; evolution_lab/engine.py |
+| I15 | Dormant `cadquery-v1` source is parsed with bounded AST/literal evaluation before any worker runs; untrusted worker gate claims are ignored and a trusted parent validator must derive B-rep validity, STEP export/round-trip, STL tessellation, existing mesh checks, build volume, locks and role leakage from captured files. SCAD aliases are legacy-only, missing source is explicit, and runtime readiness remains false until a dedicated worker exists. | evolution_lab/cadquery.py; evolution_lab/router.py |
+| I16 | Dataset v2 rows fail closed on a store-hashed human provenance audit with explicit owned/licensed-for-training/public-domain rights, deterministic/slicer evidence and matching evaluator/profile fingerprints; every included parent is independently audited and siblings use the run-derived part-family split. Physical evidence uses a deterministic printable run/candidate/artifact tuple, remains pending until candidate/mutation/memory backlinks succeed, and exact replay is idempotent. Failed exact artifacts never enter SFT, and decisive opposite verified physical evidence vetoes preference rows. V1 exports remain available unchanged and selected by default. | evolution_lab/dataset_v2.py; evolution_lab/datasets.py; evolution_lab/router.py; evolution_lab/store.py |
+| I17 | Bambu slicing runs only after every trusted CadQuery hard gate passes, uses immutable full machine/process/filament bytes plus a pinned binary identity in a networkless scratch sandbox, and treats missing/invalid/empty output or incomplete metrics as a hard rejection. Blocked candidates and evidence persist, but cannot become the restored best, a production exemplar, or a Bambuddy-deliverable candidate. Runtime readiness remains false until binaries, profiles, and a matching real smoke are all proven. | evolution_lab/slicer.py; evolution_lab/cadquery.py; evolution_lab/engine.py; evolution_lab/router.py |
 
 If a change would break any of these, it is a structural change — take it through
 **printforge-change-control** with evidence per **printforge-validation-and-qa**.
@@ -365,6 +368,9 @@ grep -n 'LAST_BACKEND' app.py                    # global single-user state (§4
 grep -n '_organic_lock\|def _free_gpu' app.py    # GPU arbitration (§2, I10)
 grep -n '"profile": dict(prof)' app.py           # profile snapshot (I11)
 grep -niA10 'Later' README.md                    # which weak points are acknowledged
+rg -n 'parse_model_contract|REQUIRED_CHECKS|unshare-all|model_envelope' evolution_lab/cadquery.py
+rg -n 'build_examples_v2|family_split|verified_join|artifact_checksum' evolution_lab tests/test_dataset_v2.py
+rg -n 'BambuStudioCLIAdapter|slice_metrics_incomplete|bambu_slicer_runtime_ready' evolution_lab tests/test_slicer_phase3.py
 ```
 
 When any of these move or change shape, update the matching section here. If

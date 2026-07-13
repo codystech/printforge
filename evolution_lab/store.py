@@ -251,15 +251,58 @@ class EvolutionStore:
             if existing.intersection(item["name"] for item in records):
                 raise ValueError("artifact already recorded")
             candidate.setdefault("artifacts", []).extend(records)
+            model_format = candidate.get("model_format") or "openscad-legacy"
+            source_name = "model.py" if model_format == "cadquery-v1" else "model.scad"
+            source_record = next((item for item in records if item["name"] == source_name), None)
+            if source_record:
+                candidate["source_artifact"] = source_name
+                candidate["source_sha256"] = f"sha256:{source_record['sha256']}"
+                candidate["model_contract_version"] = (
+                    "cadquery-v1" if model_format == "cadquery-v1" else "openscad-legacy-v1"
+                )
+                candidate.setdefault("artifact_id", source_record["sha256"])
+                provenance = candidate.get("data_provenance") if isinstance(candidate.get("data_provenance"), dict) else {}
+                audit = {
+                    "immutable": True,
+                    "issuer": "printforge-evolution-store-v1",
+                    "decision": candidate.get("training_consent_decision", "not_reviewed"),
+                    "reviewer": candidate.get("training_consent_reviewer", ""),
+                    "reviewed_at": candidate.get("training_consent_reviewed_at"),
+                    "run_id": candidate.get("run_id"),
+                    "candidate_id": candidate.get("candidate_id"),
+                    "source_artifact": source_name,
+                    "source_sha256": candidate["source_sha256"],
+                    "provenance_status": provenance.get("status", "unknown"),
+                    "source": provenance.get("source", ""),
+                    "source_revision": provenance.get("source_revision", ""),
+                    "license": provenance.get("license", ""),
+                    "license_rights": provenance.get("license_rights", "not_reviewed"),
+                }
+                audit_raw = json.dumps(
+                    audit, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                audit["audit_sha256"] = f"sha256:{hashlib.sha256(audit_raw).hexdigest()}"
+                candidate["provenance_audit"] = audit
 
         self.update_candidate(run_id, candidate_id, apply)
         return records
 
     def candidate_artifact(self, run_id: str, candidate_id: str, name: str) -> Path:
         path = self.candidate_dir(run_id, candidate_id) / "artifacts" / self._artifact_name(name)
-        if not path.is_file() or path.is_symlink():
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.root)
+            relative = path.relative_to(self.root)
+            current = self.root
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise FileNotFoundError("artifact path contains a symlink")
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError("artifact not found") from exc
+        if resolved != path or not resolved.is_file() or resolved.is_symlink():
             raise FileNotFoundError("artifact not found")
-        return path
+        return resolved
 
     def create_checkpoint(self, run_id: str, candidate_id: str, checkpoint_type: str) -> dict:
         safe_id(checkpoint_type, "checkpoint type")
@@ -505,6 +548,109 @@ class EvolutionStore:
                 break
         return records
 
+    def get_mutation_outcome(self, outcome_id: str) -> dict:
+        safe_id(outcome_id, "mutation outcome id")
+        path = self.root / "mutation_outcomes" / f"{outcome_id}.json"
+        outcome = self.read_json(path)
+        if not isinstance(outcome, dict) or outcome.get("id") != outcome_id:
+            raise ValueError("mutation outcome is malformed")
+        return outcome
+
+    def mutation_outcome_for_candidate(
+        self, run_id: str, candidate_id: str, generation: int
+    ) -> dict:
+        identity = {
+            "run_id": safe_id(run_id, "run id"),
+            "candidate_id": safe_id(candidate_id, "candidate id"),
+            "generation": int(generation),
+        }
+        return self.get_mutation_outcome(self._mutation_outcome_id(identity))
+
+    @staticmethod
+    def physical_validation_id(run_id: str, candidate_id: str, artifact_checksum: str) -> str:
+        safe_id(run_id, "run id")
+        safe_id(candidate_id, "candidate id")
+        checksum = str(artifact_checksum or "").removeprefix("sha256:").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise ValueError("invalid artifact checksum")
+        identity = "\0".join((run_id, candidate_id, checksum))
+        return f"physical_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+
+    def attach_physical_to_candidate(
+        self,
+        run_id: str,
+        candidate_id: str,
+        physical: dict,
+        *,
+        verified: bool = False,
+    ) -> dict:
+        """Idempotently attach a checksum-verified physical record to a candidate."""
+
+        physical_id = safe_id(physical["id"], "physical validation id")
+
+        def apply(candidate: dict) -> None:
+            refs = candidate.setdefault("physical_outcomes", [])
+            existing = next((item for item in refs if item.get("physical_validation_id") == physical_id), None)
+            if existing:
+                existing["verified_join"] = bool(verified)
+                existing["printed_successfully"] = bool(physical.get("printed_successfully"))
+            else:
+                refs.append({
+                    "physical_validation_id": physical_id,
+                    "artifact_checksum": physical.get("artifact_checksum"),
+                    "artifact_name": physical.get("artifact_name"),
+                    "printed_successfully": bool(physical.get("printed_successfully")),
+                    "failure_classes": list(physical.get("failure_classes") or []),
+                    "verified_join": bool(verified),
+                })
+            if verified:
+                candidate["physical_validation_status"] = (
+                    "passed" if physical.get("printed_successfully") else "failed"
+                )
+            coverage = candidate.setdefault("evidence_coverage", {})
+            coverage["physical"] = {
+                "present": bool(verified),
+                "passed": bool(physical.get("printed_successfully")) if verified else None,
+            }
+            candidate.setdefault("missing_evidence_mask", {})["physical"] = not bool(verified)
+
+        return self.update_candidate(run_id, candidate_id, apply)
+
+    def attach_physical_to_mutation(self, physical: dict, *, verified: bool = False) -> dict | None:
+        """Augment only the evidence portion of an immutable mutation outcome.
+
+        Identity, action, eligibility, and reward fields stay untouched.  The
+        append-only physical reference lets dataset-v2 join the observed print
+        back to the action that produced it.
+        """
+
+        outcome_id = self._mutation_outcome_id(physical)
+        path = self.root / "mutation_outcomes" / f"{outcome_id}.json"
+        if not path.exists():
+            return None
+        physical_id = safe_id(physical["id"], "physical validation id")
+        with self._lock:
+            outcome = self.read_json(path)
+            refs = outcome.setdefault("physical_outcomes", [])
+            existing = next((item for item in refs if item.get("physical_validation_id") == physical_id), None)
+            if existing:
+                existing["verified_join"] = bool(verified)
+                existing["artifact_checksum"] = physical.get("artifact_checksum")
+                existing["artifact_name"] = physical.get("artifact_name")
+                self.write_json(path, outcome)
+            else:
+                refs.append({
+                    "physical_validation_id": physical_id,
+                    "artifact_checksum": physical.get("artifact_checksum"),
+                    "artifact_name": physical.get("artifact_name"),
+                    "printed_successfully": bool(physical.get("printed_successfully")),
+                    "failure_classes": list(physical.get("failure_classes") or []),
+                    "verified_join": bool(verified),
+                })
+                outcome["physical_evidence_attached_at"] = utc_ts()
+                self.write_json(path, outcome)
+            return outcome
+
     def write_dataset_file(self, export_id: str, name: str, content: bytes) -> Path:
         safe_id(export_id, "export id")
         directory = self.root / "datasets" / export_id
@@ -514,9 +660,20 @@ class EvolutionStore:
 
     def dataset_file(self, export_id: str, name: str) -> Path:
         path = self.root / "datasets" / safe_id(export_id) / self._artifact_name(name)
-        if not path.is_file() or path.is_symlink():
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.root)
+            relative = path.relative_to(self.root)
+            current = self.root
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise FileNotFoundError("dataset path contains a symlink")
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError("dataset file not found") from exc
+        if resolved != path or not resolved.is_file() or resolved.is_symlink():
             raise FileNotFoundError("dataset file not found")
-        return path
+        return resolved
 
     def reset_for_selfcheck(self) -> None:
         """Test-only cleanup; never called by the application router."""
